@@ -203,6 +203,40 @@ def _md_escape(s: str) -> str:
     return str(s).replace("|", "\\|").replace("\n", " ")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# "Simplest example" scoring — pick the cleanest repro for display
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FILL_SCORE = {
+    "zeros": 0, "ones": 1, "all_true": 1, "all_false": 1,
+    "alternating": 2, "sequential": 2, "sparse": 3,
+    "random": 4, "onehot": 4, "edges": 5,
+}
+_SHAPE_SCORE = {
+    "scalar": 0,
+    "1d-1": 1, "1d-9": 1, "1d-10": 1, "1d-30": 1,
+    "2d": 2, "3d": 3,
+    "B-1-1-1": 4, "B-1-1-W": 4, "B-1-H-1": 4, "B-1-H-W": 4, "B-1-9-9": 4,
+    "B-C-1-1": 5,
+    "BCHW-tiny": 5, "BCHW-5": 6, "BCHW-9": 6,
+    "BCHW-asym": 7, "BCHW": 8, "BCHW-batchN": 9,
+}
+
+
+def _simplicity_score(row: dict) -> tuple:
+    """Lower is simpler. Prefer fewer/smaller inputs, simpler fills, fewer attrs."""
+    case = row.get("case", {}) or {}
+    ports, attrs_raw = _parse_trigger(case.get("label", ""))
+    shape_total = sum(_SHAPE_SCORE.get(p[2], 10) for p in ports)
+    fill_total = sum(_FILL_SCORE.get(p[4], 10) for p in ports)
+    attr_complexity = max(0, len(attrs_raw or "") - 2)
+    return (len(ports), shape_total, fill_total, attr_complexity)
+
+
+def _trigger_signature(row: dict) -> str:
+    return (row.get("case", {}) or {}).get("label", "")
+
+
 @dataclass
 class IssueGroup:
     category: str
@@ -211,6 +245,7 @@ class IssueGroup:
     opsets: set[int | str] = field(default_factory=set)
     surfaces: int = 0
     case_keys: set[tuple[str, int | str]] = field(default_factory=set)
+    trigger_sigs: set[str] = field(default_factory=set)
     representative: dict | None = None
     valid_cases: int = 0
 
@@ -218,8 +253,14 @@ class IssueGroup:
         self.opsets.add(_opset(row))
         self.surfaces += 1
         self.case_keys.add((row.get("report_op", self.op), row.get("case_index", "?")))
-        if self.representative is None:
+        self.trigger_sigs.add(_trigger_signature(row))
+        # Keep the simplest row as representative.
+        if self.representative is None or _simplicity_score(row) < _simplicity_score(self.representative):
             self.representative = row
+
+    @property
+    def unique_triggers(self) -> int:
+        return len(self.trigger_sigs)
 
 
 def _load_profile_counts(paths: Iterable[Path]) -> dict[tuple[str, int | str], int]:
@@ -256,6 +297,13 @@ def build_structured_groups(findings_paths: Iterable[Path], profile_paths: Itera
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _kind_cell(g: IssueGroup) -> str:
+    """One of: `required` (single trigger), or `example (1 of N)`."""
+    if g.unique_triggers <= 1:
+        return "**required**"
+    return f"example (1/{g.unique_triggers})"
+
+
 def _row_type(g: IssueGroup) -> list[str]:
     row = g.representative or {}
     case = row.get("case", {})
@@ -267,6 +315,7 @@ def _row_type(g: IssueGroup) -> list[str]:
         _fmt_opsets(g.opsets),
         _md_escape(_format_inputs(ports)),
         _md_escape(_format_attrs(attrs_raw)),
+        _kind_cell(g),
         _md_cell(truth_dtype),
         _md_cell(claim_dtype),
         _coverage_cell(len(g.case_keys), g.surfaces, g.valid_cases),
@@ -285,6 +334,7 @@ def _row_shape(g: IssueGroup) -> list[str]:
         g.family,
         _md_escape(_format_inputs(ports)),
         _md_escape(_format_attrs(attrs_raw)),
+        _kind_cell(g),
         _md_shape(truth.get("shape")),
         _md_shape(claim.get("shape")),
         _coverage_cell(len(g.case_keys), g.surfaces, g.valid_cases),
@@ -303,6 +353,7 @@ def _row_error(g: IssueGroup) -> list[str]:
         g.family,
         _md_escape(_format_inputs(ports)),
         _md_escape(_format_attrs(attrs_raw)),
+        _kind_cell(g),
         f"`{err_short}`" if err_short != "—" else "—",
         _coverage_cell(len(g.case_keys), g.surfaces, g.valid_cases),
     ]
@@ -339,29 +390,31 @@ def render_structured_report(findings_paths: Iterable[Path], profile_paths: Iter
         "**Columns:**",
         "- **Inputs**: each port shown as `name: shape/dtype/fill`. `(init)` marks initializer (constant input).",
         "- **Attrs**: op attributes used in the failing case.",
-        "- **Cases**: `hits/valid_cases` — how many ORT-valid configurations onnx_tool got wrong.",
-        "  Trailing `(N surf)` means N raw findings collapsed into the same group.",
+        "- **Repro**: `required` if the shown Inputs+Attrs is the only configuration that triggers the bug; "
+        "`example (1/N)` if it's one of N distinct triggering configurations (we show the simplest).",
+        "- **Cases**: `hits/valid_cases` — how many ORT-valid configurations onnx_tool got wrong. "
+        "Trailing `(N surf)` means N raw findings collapsed into the same group.",
         "",
     ]
 
     # Incorrect Type
     lines += ["## Incorrect Type", ""]
     lines += _table(
-        ["Op", "Opsets", "Inputs", "Attrs", "ORT", "onnx_tool", "Cases"],
+        ["Op", "Opsets", "Inputs", "Attrs", "Repro", "ORT", "onnx_tool", "Cases"],
         [_row_type(g) for g in by_cat["Incorrect Type"]],
     )
 
     # Incorrect Shape
     lines += ["## Incorrect Shape", ""]
     lines += _table(
-        ["Op", "Opsets", "Family", "Inputs", "Attrs", "ORT shape", "onnx_tool shape", "Cases"],
+        ["Op", "Opsets", "Family", "Inputs", "Attrs", "Repro", "ORT shape", "onnx_tool shape", "Cases"],
         [_row_shape(g) for g in by_cat["Incorrect Shape"]],
     )
 
     # Incorrect Errors
     lines += ["## Incorrect Errors", ""]
     lines += _table(
-        ["Op", "Opsets", "Family", "Inputs", "Attrs", "onnx_tool error", "Cases"],
+        ["Op", "Opsets", "Family", "Inputs", "Attrs", "Repro", "onnx_tool error", "Cases"],
         [_row_error(g) for g in by_cat["Incorrect Errors"]],
     )
 
