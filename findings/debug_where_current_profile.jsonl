@@ -1,0 +1,1 @@
+{"build_errors": 0, "cases": 70, "disagreements": 4, "invalid": 32, "invalid_checker_failed": 0, "invalid_checker_passed": 32, "op": "Where@11", "timings": {"case_total": 0.1920509998453781, "generate": 0.020805399981327355, "onnx_tool": 0.1675910001504235, "ort": 0.023211399966385216, "run": 0.21941010002046824}, "valid": 38}

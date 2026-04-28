@@ -1,0 +1,368 @@
+"""Structured issue report from findings/profile JSONL artifacts.
+
+Renders confirmed onnx_tool divergences as compact markdown tables grouped
+by category (Type / Shape / Errors). Each row is one (op, opsets, family)
+issue; columns describe how the test was set up and what diverged.
+"""
+from __future__ import annotations
+
+import json
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+
+TYPE_CLASSES = {"wrong-dtype"}
+SHAPE_CLASSES = {"wrong-shape", "wrong-bytes", "scalar-volume", "missing-tensor", "constant-uncounted"}
+ERROR_CLASSES = {"onnx-tool-fails-valid-model", "onnx-tool-timeout-valid-model"}
+
+
+def _read_jsonl(paths: Iterable[Path]) -> Iterable[dict]:
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+
+
+def _opset(row: dict) -> int | str:
+    opsets = row.get("case", {}).get("opsets", {})
+    if "" in opsets:
+        return opsets[""]
+    m = re.search(r"@(\d+)$", row.get("report_op", ""))
+    return int(m.group(1)) if m else "?"
+
+
+def _op(row: dict) -> str:
+    return row.get("case", {}).get("op") or row.get("report_op", "").split("@")[0]
+
+
+def _product(shape) -> int | None:
+    if shape is None:
+        return None
+    n = 1
+    for d in shape:
+        n *= int(d)
+    return n
+
+
+def _error_family(error: str | None) -> str:
+    if not error:
+        return "unknown error"
+    head = error.splitlines()[0]
+    for marker in (":", "["):
+        if marker in head:
+            head = head.split(marker, 1)[0]
+    return head.strip()[:120] or "unknown error"
+
+
+def _shape_family(row: dict) -> str:
+    klass = row["bug_class"]
+    if klass == "scalar-volume":
+        return "scalar counted as 0 bytes"
+    if klass == "missing-tensor":
+        return "tensor missing from tensormap"
+    if klass == "constant-uncounted":
+        return "constant output not counted"
+    if klass == "wrong-bytes":
+        return "byte count mismatch"
+
+    truth, claim = row.get("truth", {}), row.get("claim", {})
+    ts, cs = truth.get("shape"), claim.get("shape")
+    tv, cv = _product(ts), _product(cs)
+    if tv is not None and cv is not None and cv < tv:
+        return "shape undercount"
+    if tv is not None and cv is not None and cv > tv:
+        return "shape overcount"
+    if ts is not None and cs is not None and len(ts) != len(cs):
+        return "rank mismatch"
+    return "wrong shape"
+
+
+def _family(row: dict) -> str:
+    klass = row["bug_class"]
+    if klass in TYPE_CLASSES:
+        return f"{row.get('truth', {}).get('dtype')} → {row.get('claim', {}).get('dtype')}"
+    if klass in SHAPE_CLASSES:
+        return _shape_family(row)
+    if klass in ERROR_CLASSES:
+        return _error_family(row.get("claim_error") or row.get("note"))
+    return klass
+
+
+def _category(klass: str) -> str | None:
+    if klass in TYPE_CLASSES:
+        return "Incorrect Type"
+    if klass in SHAPE_CLASSES:
+        return "Incorrect Shape"
+    if klass in ERROR_CLASSES:
+        return "Incorrect Errors"
+    return None
+
+
+def _fmt_opsets(vals: set[int | str]) -> str:
+    ints = sorted(v for v in vals if isinstance(v, int))
+    other = sorted(str(v) for v in vals if not isinstance(v, int))
+    ranges = []
+    i = 0
+    while i < len(ints):
+        start = end = ints[i]
+        while i + 1 < len(ints) and ints[i + 1] == end + 1:
+            i += 1
+            end = ints[i]
+        ranges.append(str(start) if start == end else f"{start}–{end}")
+        i += 1
+    return ", ".join(ranges + other)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger parsing — turn raw labels into human-readable pieces
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Raw label format from the harness:
+#     "X(input)=BCHW/float32/random data2(init)=1d-10/int64/zeros {'axis': 0} outputs=1"
+#
+# We split it into:
+#   inputs: list of (name, kind, shape, dtype, fill)
+#   attrs:  dict of attribute name -> value (parsed where possible)
+
+_PORT_RE = re.compile(r"(\w+)\((input|init)\)=([^\s]+)")
+_ATTRS_RE = re.compile(r"\{[^}]*\}")
+
+
+def _parse_trigger(label: str) -> tuple[list[tuple[str, str, str, str, str]], str]:
+    """Return (ports, attrs_str) parsed from a TestCase.label."""
+    ports = []
+    for m in _PORT_RE.finditer(label or ""):
+        name, kind, spec = m.group(1), m.group(2), m.group(3)
+        parts = spec.split("/")
+        shape = parts[0] if len(parts) > 0 else ""
+        dtype = parts[1] if len(parts) > 1 else ""
+        fill = parts[2] if len(parts) > 2 else ""
+        ports.append((name, kind, shape, dtype, fill))
+
+    attrs_match = _ATTRS_RE.search(label or "")
+    attrs_raw = attrs_match.group(0) if attrs_match else ""
+    return ports, attrs_raw
+
+
+def _format_inputs(ports: list[tuple[str, str, str, str, str]]) -> str:
+    """Render input ports compactly. Joins all ports with ` · ` separator."""
+    if not ports:
+        return "—"
+    chunks = []
+    for name, kind, shape, dtype, fill in ports:
+        kind_tag = "" if kind == "input" else " (init)"
+        # e.g. "X: BCHW/f32/random" or "data: 1d-10/i64/zeros (init)"
+        d_short = dtype.replace("float", "f").replace("int", "i").replace("uint", "u")
+        chunks.append(f"`{name}`{kind_tag}: {shape}/{d_short}/{fill}")
+    return "<br>".join(chunks)
+
+
+def _format_attrs(attrs_raw: str) -> str:
+    """Strip dict braces and quoting noise from attrs string."""
+    if not attrs_raw or attrs_raw == "{}":
+        return "—"
+    s = attrs_raw.strip("{}").strip()
+    # Replace `'key':` with `key=` for compactness
+    s = re.sub(r"'(\w+)':\s*", r"\1=", s)
+    s = re.sub(r"b'([^']*)'", r"\1", s)  # strip bytes prefix
+    return f"`{s}`"
+
+
+def _md_shape(s) -> str:
+    if s is None:
+        return "—"
+    return f"`{tuple(s)}`"
+
+
+def _md_cell(s) -> str:
+    if s is None or s == "":
+        return "—"
+    return f"`{s}`"
+
+
+def _coverage_cell(hit_cases: int, surfaces: int, valid: int | None) -> str:
+    if valid is None or valid <= 0:
+        base = f"{hit_cases}"
+    elif hit_cases >= valid:
+        base = f"{hit_cases}/{valid}"
+    else:
+        base = f"{hit_cases}/{valid}"
+    if surfaces != hit_cases:
+        base += f" ({surfaces} surf)"
+    return base
+
+
+def _md_escape(s: str) -> str:
+    return str(s).replace("|", "\\|").replace("\n", " ")
+
+
+@dataclass
+class IssueGroup:
+    category: str
+    op: str
+    family: str
+    opsets: set[int | str] = field(default_factory=set)
+    surfaces: int = 0
+    case_keys: set[tuple[str, int | str]] = field(default_factory=set)
+    representative: dict | None = None
+    valid_cases: int = 0
+
+    def add(self, row: dict) -> None:
+        self.opsets.add(_opset(row))
+        self.surfaces += 1
+        self.case_keys.add((row.get("report_op", self.op), row.get("case_index", "?")))
+        if self.representative is None:
+            self.representative = row
+
+
+def _load_profile_counts(paths: Iterable[Path]) -> dict[tuple[str, int | str], int]:
+    out = {}
+    for row in _read_jsonl(paths):
+        op = row.get("op", "")
+        if "@" in op:
+            name, opset = op.rsplit("@", 1)
+            out[(name, int(opset) if opset.isdigit() else opset)] = int(row.get("valid", 0))
+    return out
+
+
+def build_structured_groups(findings_paths: Iterable[Path], profile_paths: Iterable[Path] = ()) -> list[IssueGroup]:
+    profiles = _load_profile_counts(profile_paths)
+    groups: dict[tuple[str, str, str], IssueGroup] = {}
+    for row in _read_jsonl(findings_paths):
+        cat = _category(row.get("bug_class", ""))
+        if not cat or row.get("classification") != "confirmed":
+            continue
+        op = _op(row)
+        fam = _family(row)
+        key = (cat, op, fam)
+        groups.setdefault(key, IssueGroup(category=cat, op=op, family=fam)).add(row)
+
+    for g in groups.values():
+        g.valid_cases = sum(profiles.get((g.op, opset), 0) for opset in g.opsets)
+
+    order = {"Incorrect Type": 0, "Incorrect Shape": 1, "Incorrect Errors": 2}
+    return sorted(groups.values(), key=lambda g: (order[g.category], g.family, g.op, _fmt_opsets(g.opsets), -g.surfaces))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Table rendering
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _row_type(g: IssueGroup) -> list[str]:
+    row = g.representative or {}
+    case = row.get("case", {})
+    ports, attrs_raw = _parse_trigger(case.get("label", ""))
+    truth_dtype = (row.get("truth") or {}).get("dtype")
+    claim_dtype = (row.get("claim") or {}).get("dtype")
+    return [
+        f"`{g.op}`",
+        _fmt_opsets(g.opsets),
+        _md_escape(_format_inputs(ports)),
+        _md_escape(_format_attrs(attrs_raw)),
+        _md_cell(truth_dtype),
+        _md_cell(claim_dtype),
+        _coverage_cell(len(g.case_keys), g.surfaces, g.valid_cases),
+    ]
+
+
+def _row_shape(g: IssueGroup) -> list[str]:
+    row = g.representative or {}
+    case = row.get("case", {})
+    ports, attrs_raw = _parse_trigger(case.get("label", ""))
+    truth = row.get("truth") or {}
+    claim = row.get("claim") or {}
+    return [
+        f"`{g.op}`",
+        _fmt_opsets(g.opsets),
+        g.family,
+        _md_escape(_format_inputs(ports)),
+        _md_escape(_format_attrs(attrs_raw)),
+        _md_shape(truth.get("shape")),
+        _md_shape(claim.get("shape")),
+        _coverage_cell(len(g.case_keys), g.surfaces, g.valid_cases),
+    ]
+
+
+def _row_error(g: IssueGroup) -> list[str]:
+    row = g.representative or {}
+    case = row.get("case", {})
+    ports, attrs_raw = _parse_trigger(case.get("label", ""))
+    err = row.get("claim_error") or row.get("note") or ""
+    err_short = _md_escape(err.splitlines()[0][:140]) if err else "—"
+    return [
+        f"`{g.op}`",
+        _fmt_opsets(g.opsets),
+        g.family,
+        _md_escape(_format_inputs(ports)),
+        _md_escape(_format_attrs(attrs_raw)),
+        f"`{err_short}`" if err_short != "—" else "—",
+        _coverage_cell(len(g.case_keys), g.surfaces, g.valid_cases),
+    ]
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    if not rows:
+        return ["_No confirmed findings._", ""]
+    out = ["| " + " | ".join(headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(r) + " |")
+    out.append("")
+    return out
+
+
+def render_structured_report(findings_paths: Iterable[Path], profile_paths: Iterable[Path] = ()) -> str:
+    groups = build_structured_groups(findings_paths, profile_paths)
+    by_cat = defaultdict(list)
+    for g in groups:
+        by_cat[g.category].append(g)
+
+    n_total = len(groups)
+    n_type = len(by_cat["Incorrect Type"])
+    n_shape = len(by_cat["Incorrect Shape"])
+    n_err = len(by_cat["Incorrect Errors"])
+
+    lines = [
+        "# Structured onnx_tool issue report",
+        "",
+        f"Confirmed divergences vs. ORT, grouped by `(op, family, opsets)`. "
+        f"**{n_total} issues**: {n_type} type, {n_shape} shape, {n_err} error.",
+        "",
+        "**Columns:**",
+        "- **Inputs**: each port shown as `name: shape/dtype/fill`. `(init)` marks initializer (constant input).",
+        "- **Attrs**: op attributes used in the failing case.",
+        "- **Cases**: `hits/valid_cases` — how many ORT-valid configurations onnx_tool got wrong.",
+        "  Trailing `(N surf)` means N raw findings collapsed into the same group.",
+        "",
+    ]
+
+    # Incorrect Type
+    lines += ["## Incorrect Type", ""]
+    lines += _table(
+        ["Op", "Opsets", "Inputs", "Attrs", "ORT", "onnx_tool", "Cases"],
+        [_row_type(g) for g in by_cat["Incorrect Type"]],
+    )
+
+    # Incorrect Shape
+    lines += ["## Incorrect Shape", ""]
+    lines += _table(
+        ["Op", "Opsets", "Family", "Inputs", "Attrs", "ORT shape", "onnx_tool shape", "Cases"],
+        [_row_shape(g) for g in by_cat["Incorrect Shape"]],
+    )
+
+    # Incorrect Errors
+    lines += ["## Incorrect Errors", ""]
+    lines += _table(
+        ["Op", "Opsets", "Family", "Inputs", "Attrs", "onnx_tool error", "Cases"],
+        [_row_error(g) for g in by_cat["Incorrect Errors"]],
+    )
+
+    return "\n".join(lines)

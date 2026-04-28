@@ -234,10 +234,35 @@ def _apply_input_constraints(spec: OpSpec, input_cases: tuple[InputCase, ...], a
                 dtype_label=cond_case.dtype_label, fill_label=cond_case.fill_label, is_init=cond_case.is_init,
             )
             input_cases = tuple(new_cond if c.name == "condition" else c for c in input_cases)
+    if spec.name in {"BatchNormalization", "InstanceNormalization"}:
+        x_case = next((c for c in input_cases if c.name in {"X", "input"}), None)
+        if x_case is not None and len(x_case.shape) >= 2:
+            cdim = int(x_case.shape[1])
+            label = f"1d-{cdim}" if f"1d-{cdim}" in SHAPE_BUCKETS else "1d-1"
+            shape = SHAPE_BUCKETS[label]
+            channel_inputs = {"scale", "B", "bias", "mean", "var"}
+            input_cases = tuple(
+                InputCase(c.name, label, shape, c.dtype_label, c.fill_label, c.is_init)
+                if c.name in channel_inputs else c
+                for c in input_cases
+            )
     return input_cases
 
 
-def build_case(spec: OpSpec, input_cases: tuple[InputCase, ...], attrs: dict, *, idx: int = 0) -> TestCase:
+def _materialize_case_array(spec: OpSpec, case: InputCase, input_cases: tuple[InputCase, ...], attrs: dict) -> np.ndarray:
+    if spec.name == "TopK" and case.name == "K":
+        x_case = next((c for c in input_cases if c.name == "X"), None)
+        axis = int(attrs.get("axis", -1))
+        axis_size = 1
+        if x_case is not None and x_case.shape:
+            axis %= len(x_case.shape)
+            axis_size = int(x_case.shape[axis])
+        return np.array([max(1, min(axis_size, 2))], dtype=case.np_dtype)
+    return case.materialize()
+
+
+def build_case(spec: OpSpec, input_cases: tuple[InputCase, ...], attrs: dict, *,
+               idx: int = 0, output_mask: tuple[bool, ...] | None = None) -> TestCase:
     """Build a concrete test case from a spec and input configuration."""
     nodes = []
     initializers: list[onnx.TensorProto] = []
@@ -254,10 +279,10 @@ def build_case(spec: OpSpec, input_cases: tuple[InputCase, ...], attrs: dict, *,
             port_input_names.append("")
             continue
         if case.is_init:
-            arr = case.materialize()
+            arr = _materialize_case_array(spec, case, input_cases, attrs)
             initializers.append(onnx.numpy_helper.from_array(arr, name=case.name))
         else:
-            arr = case.materialize()
+            arr = _materialize_case_array(spec, case, input_cases, attrs)
             vi = onnx.helper.make_tensor_value_info(case.name, case.onnx_dtype, list(case.shape))
             graph_inputs.append(vi)
             feeds[case.name] = arr
@@ -276,13 +301,39 @@ def build_case(spec: OpSpec, input_cases: tuple[InputCase, ...], attrs: dict, *,
         port_input_names.append(sname)
 
     clean_attrs = {k: v for k, v in attrs.items() if not k.startswith("_") and v is not None}
-    output_names = [out.name or f"output_{i}" for i, out in enumerate(spec.outputs)]
-    if not output_names:
-        output_names = [f"output_{i}" for i in range(spec.output_count or 1)]
-    node = onnx.helper.make_node(spec.name, inputs=port_input_names, outputs=output_names, **clean_attrs)
+    used_names = {c.name for c in input_cases} | {i.name for i in initializers}
+    spec_outputs = spec.outputs or tuple()
+    if output_mask is None:
+        output_mask = tuple(not out.is_optional for out in spec_outputs)
+    if spec_outputs and not any(output_mask):
+        output_mask = (True,) + tuple(False for _ in spec_outputs[1:])
+
+    node_output_names: list[str] = []
+    graph_output_pairs = []
+    for i, out in enumerate(spec_outputs):
+        if i < len(output_mask) and not output_mask[i]:
+            node_output_names.append("")
+            continue
+        base = out.name or f"output_{i}"
+        name = f"{base}_out" if base in used_names else base
+        while name in used_names or name in node_output_names:
+            name = f"{base}_{len(graph_output_pairs)}"
+        node_output_names.append(name)
+        graph_output_pairs.append((name, out))
+    while node_output_names and node_output_names[-1] == "":
+        node_output_names.pop()
+    if not node_output_names:
+        node_output_names = [f"output_{i}" for i in range(spec.output_count or 1)]
+    node = onnx.helper.make_node(spec.name, inputs=port_input_names, outputs=node_output_names, **clean_attrs)
     nodes.append(node)
 
     def output_elem_type(out) -> int:
+        if spec.name == "Cast" and "to" in attrs:
+            return int(attrs["to"])
+        if spec.name in {"RandomNormal", "RandomUniform"} and "dtype" in attrs:
+            return int(attrs["dtype"])
+        if spec.name in {"RandomNormal", "RandomUniform"}:
+            return onnx.TensorProto.FLOAT
         for port, case in zip(spec.inputs, (by_name.get(p.name) for p in spec.inputs)):
             if case is not None and out.type_param and out.type_param == port.type_param:
                 return case.onnx_dtype
@@ -294,19 +345,28 @@ def build_case(spec: OpSpec, input_cases: tuple[InputCase, ...], attrs: dict, *,
             return onnx_dtype(out.dtype_labels[0])
         return onnx.TensorProto.FLOAT
 
+    def output_shape(out) -> list[int] | None:
+        if spec.name in {"RandomNormal", "RandomUniform"} and isinstance(attrs.get("shape"), (list, tuple)):
+            return [int(x) for x in attrs["shape"]]
+        for port, case in zip(spec.inputs, (by_name.get(p.name) for p in spec.inputs)):
+            if case is not None and out.type_param and out.type_param == port.type_param:
+                return list(case.shape)
+        return None
+
     graph_outputs = [
-        onnx.helper.make_tensor_value_info(name, output_elem_type(out), None)
-        for name, out in zip(output_names, spec.outputs or ())
+        onnx.helper.make_tensor_value_info(name, output_elem_type(out), output_shape(out))
+        for name, out in graph_output_pairs
     ]
     if not graph_outputs:
         graph_outputs = [onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, None)
-                         for name in output_names]
+                         for name in node_output_names if name]
 
     graph = onnx.helper.make_graph(nodes, f"{spec.name}_{idx}", graph_inputs, graph_outputs,
                                     initializer=initializers if initializers else None)
     model = onnx.helper.make_model(graph, producer_name="onnx_tool_audit", opset_imports=[onnx.helper.make_opsetid("", spec.opset)])
 
-    label = " ".join([c.label() for c in input_cases]) + " " + str(attrs if attrs else "")
+    out_label = "" if output_mask is None else f" outputs={''.join('1' if b else '0' for b in output_mask)}"
+    label = " ".join([c.label() for c in input_cases]) + " " + str(attrs if attrs else "") + out_label
     return TestCase(op=spec.name, label=label, model=model, feeds=feeds, input_cases=input_cases, attrs=attrs)
 
 
@@ -365,6 +425,47 @@ def _first_matching(choices: list[InputCase | None], **want) -> InputCase | None
     return next((c for c in choices if c is not None), None)
 
 
+def _preferred_dtype(choices: list[InputCase | None]) -> str | None:
+    labels = {c.dtype_label for c in choices if c is not None}
+    for label in ("float32", "int64", "uint8", "bool"):
+        if label in labels:
+            return label
+    return next(iter(sorted(labels)), None)
+
+
+def _stress_input_combos(spec: OpSpec, choice_sets: list[list[InputCase | None]]) -> list[tuple[InputCase | None, ...]]:
+    """Generic multi-input shape stress cases, especially for broadcast-like ops."""
+    required = [i for i, p in enumerate(spec.inputs) if not p.is_optional]
+    if len(required) < 2:
+        return []
+
+    patterns = [
+        ("B-1-9-9", "B-C-1-1", "B-C-1-1"),
+        ("B-C-1-1", "B-1-H-1", "scalar"),
+        ("scalar", "B-C-1-1", "B-1-H-1"),
+    ]
+    out = []
+    for pattern in patterns:
+        combo = [None if p.is_optional else _first_matching(cs) for p, cs in zip(spec.inputs, choice_sets)]
+        dtype_by_root = {}
+        ok = True
+        for pos, idx in enumerate(required):
+            port = spec.inputs[idx]
+            root = port.tied_dtype_to or port.name
+            dtype_by_root.setdefault(root, _preferred_dtype(choice_sets[idx]))
+            shape_label = pattern[min(pos, len(pattern) - 1)]
+            picked = _first_matching(choice_sets[idx],
+                                     shape_label=shape_label,
+                                     dtype_label=dtype_by_root[root])
+            if picked is None:
+                ok = False
+                break
+            combo[idx] = picked
+        if ok:
+            out.append(tuple(combo))
+    return out
+
+
 def _combo_from_index(choice_sets: list[list], index: int) -> tuple:
     picked = []
     for choices in reversed(choice_sets):
@@ -397,6 +498,9 @@ def _sample_input_combos(spec: OpSpec, limit: int = MAX_CASES_PER_OP) -> list[tu
         if key not in seen and _combo_ok(spec, combo):
             seen.add(key)
             out.append(_strip_omitted(combo))
+
+    for combo in _stress_input_combos(spec, choice_sets):
+        add(combo)
 
     first_present = tuple(_first_matching(cs) for cs in choice_sets)
     first_optional_omitted = tuple(None if port.is_optional else _first_matching(cs)
@@ -437,10 +541,14 @@ def _attr_choices(name: str, spec: AttrSpec) -> tuple:
     vals = []
     if not spec.required:
         vals.append(None)
-    if spec.default not in (None, ""):
-        vals.append(spec.default)
     if t == "INT":
-        vals += [0, 1, -1] if "axis" in name else [0, 1]
+        if name == "to":
+            vals += [onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16, onnx.TensorProto.DOUBLE,
+                     onnx.TensorProto.INT64, onnx.TensorProto.BOOL]
+        elif name == "dtype":
+            vals += [onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16, onnx.TensorProto.DOUBLE]
+        else:
+            vals += [0, 1, -1] if "axis" in name else [0, 1]
     elif t == "INTS":
         if name == "kernel_shape":
             vals += [[1, 1], [2, 2], [3, 3]]
@@ -459,15 +567,46 @@ def _attr_choices(name: str, spec: AttrSpec) -> tuple:
     elif t == "FLOATS":
         vals += [[0.0], [0.0, 1.0]]
     elif t == "STRING":
-        vals += [b"NOTSET", b"SAME_UPPER"] if name == "auto_pad" else [b""]
+        if name == "auto_pad":
+            vals += [b"NOTSET", b"SAME_UPPER"]
+        elif name == "direction":
+            vals += [b"LEFT", b"RIGHT"]
+        else:
+            vals += [b""]
     elif t == "STRINGS":
         vals += [[b""]]
     elif t == "TENSOR":
         vals += [_tensor_value()]
     elif t == "TENSORS":
         vals += [[_tensor_value()]]
+
+    default = None if name in {"to", "dtype"} and spec.default == 0 else spec.default
+    if _attr_default_fits(t, default):
+        vals.insert(1 if not spec.required else 0, default)
     # preserve order, drop dupes by repr because lists/tensors are unhashable
     return tuple({repr(v): v for v in vals}.values()) or (None,)
+
+
+def _attr_default_fits(attr_type: str, value) -> bool:
+    if value in (None, ""):
+        return False
+    if attr_type == "INT":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if attr_type == "INTS":
+        return isinstance(value, (list, tuple)) and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+    if attr_type == "FLOAT":
+        return isinstance(value, float)
+    if attr_type == "FLOATS":
+        return isinstance(value, (list, tuple)) and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)
+    if attr_type == "STRING":
+        return isinstance(value, (bytes, str))
+    if attr_type == "STRINGS":
+        return isinstance(value, (list, tuple)) and all(isinstance(v, (bytes, str)) for v in value)
+    if attr_type == "TENSOR":
+        return isinstance(value, onnx.TensorProto)
+    if attr_type == "TENSORS":
+        return isinstance(value, (list, tuple)) and all(isinstance(v, onnx.TensorProto) for v in value)
+    return False
 
 
 def _attr_choice_sets(spec: OpSpec) -> tuple[list[str], list[tuple]]:
@@ -521,6 +660,24 @@ def _expand_attrs(spec: OpSpec, limit: int = MAX_CASES_PER_OP) -> list[dict[str,
     return out[:limit]
 
 
+def _output_masks(spec: OpSpec) -> list[tuple[bool, ...]]:
+    if not spec.outputs:
+        return [()]
+    optional_idxs = [i for i, out in enumerate(spec.outputs) if out.is_optional]
+    base = tuple(not out.is_optional for out in spec.outputs)
+    masks = [base]
+    if optional_idxs:
+        all_present = tuple(True for _ in spec.outputs)
+        masks.append(all_present)
+        if spec.name != "BatchNormalization":
+            for count in range(1, len(optional_idxs) + 1):
+                mask = list(base)
+                for idx in optional_idxs[:count]:
+                    mask[idx] = True
+                masks.append(tuple(mask))
+    return list({repr(m): m for m in masks}.values())[:32]
+
+
 def _cap(cases: list, limit: int) -> list:
     """Cap case list at limit, preserving diversity."""
     if len(cases) <= limit:
@@ -568,6 +725,9 @@ def _pool_attrs_valid(input_cases: tuple[InputCase, ...], attrs: dict) -> bool:
     strides = attrs.get("strides")
     if strides is not None and (not isinstance(strides, (list, tuple)) or len(strides) != spatial):
         return False
+    dilations = attrs.get("dilations")
+    if dilations is not None and (not isinstance(dilations, (list, tuple)) or len(dilations) != spatial):
+        return False
     pads = attrs.get("pads", [0] * (2 * spatial))
     if not isinstance(pads, (list, tuple)) or len(pads) != 2 * spatial:
         return False
@@ -581,6 +741,7 @@ def generate_single_op(spec: OpSpec, *, limit: int = MAX_CASES_PER_OP) -> list[T
     """Generate all test cases for one operator."""
     inp_combos = _sample_input_combos(spec, limit=limit)
     attr_combos = _expand_attrs(spec, limit=limit)
+    output_masks = _output_masks(spec)
 
     if spec.name in _BROADCAST_OPS:
         names = _BROADCAST_OPS[spec.name]
@@ -596,36 +757,45 @@ def generate_single_op(spec: OpSpec, *, limit: int = MAX_CASES_PER_OP) -> list[T
             axis = int(attrs.get("axis", -1))
             rank = max(len(c.shape) for c in inp_combo) if inp_combo else 0
             return rank > 0 and -rank <= axis < rank
+        if spec.name == "TopK":
+            x_case = next((c for c in inp_combo if c.name == "X"), None)
+            axis = int(attrs.get("axis", -1))
+            return x_case is not None and len(x_case.shape) > 0 and -len(x_case.shape) <= axis < len(x_case.shape)
         if spec.name in _POOL_OPS:
             return _pool_attrs_valid(inp_combo, attrs)
+        if spec.name in {"BatchNormalization", "InstanceNormalization"}:
+            x_case = next((c for c in inp_combo if c.name in {"X", "input"}), None)
+            return x_case is not None and len(x_case.shape) >= 2
         return True
 
     pairs = []
     seen = set()
 
-    def add_pair(inp_combo, attrs) -> None:
+    def add_pair(inp_combo, attrs, output_mask) -> None:
         if not good_pair(inp_combo, attrs):
             return
-        key = (tuple(c.label() for c in inp_combo), repr(attrs))
+        key = (tuple(c.label() for c in inp_combo), repr(attrs), output_mask)
         if key not in seen:
             seen.add(key)
-            pairs.append((inp_combo, attrs))
+            pairs.append((inp_combo, attrs, output_mask))
 
     for i, inp_combo in enumerate(inp_combos):
-        add_pair(inp_combo, attr_combos[i % len(attr_combos)])
+        add_pair(inp_combo, attr_combos[i % len(attr_combos)], output_masks[i % len(output_masks)])
     for i, attrs in enumerate(attr_combos):
-        add_pair(inp_combos[i % len(inp_combos)], attrs)
+        add_pair(inp_combos[i % len(inp_combos)], attrs, output_masks[i % len(output_masks)])
+    for i, output_mask in enumerate(output_masks):
+        add_pair(inp_combos[i % len(inp_combos)], attr_combos[i % len(attr_combos)], output_mask)
 
-    total = len(inp_combos) * len(attr_combos)
+    total = len(inp_combos) * len(attr_combos) * len(output_masks)
     for idx in _spread_indices(total, limit * 2):
-        inp_combo, attrs = _combo_from_index([inp_combos, attr_combos], idx)
-        add_pair(inp_combo, attrs)
+        inp_combo, attrs, output_mask = _combo_from_index([inp_combos, attr_combos, output_masks], idx)
+        add_pair(inp_combo, attrs, output_mask)
         if len(pairs) >= limit:
             break
 
     cases = []
-    for idx, (inp_combo, attr_combo) in enumerate(pairs[:limit]):
-        case = build_case(spec, inp_combo, attr_combo, idx=idx)
+    for idx, (inp_combo, attr_combo, output_mask) in enumerate(pairs[:limit]):
+        case = build_case(spec, inp_combo, attr_combo, idx=idx, output_mask=output_mask)
         cases.append(case)
 
     return cases

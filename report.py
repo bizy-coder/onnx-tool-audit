@@ -50,6 +50,8 @@ def fingerprint(op: str, diff: TensorDiff) -> tuple:
         return (klass, op)
     if klass == "onnx-tool-fails-valid-model":
         return (klass, op)
+    if klass == "ort-rejects-checker-valid-model":
+        return (klass, op)
     if klass == "invalid-test-case":
         return (klass, op)
     return (klass, op)
@@ -258,6 +260,7 @@ def iter_raw_findings(reports: Iterable[OpReport]):
                 "report_op": report.op,
                 "case_index": case_idx,
                 "case": _case_meta(case),
+                "timings": _jsonable(case.timings),
                 "truth_total_bytes": case.diff.truth_total_bytes,
                 "claim_total_bytes": case.diff.claim_total_bytes,
             }
@@ -306,6 +309,66 @@ def render_case_findings_jsonl(report_op: str, case: CaseResult) -> str:
     return "\n".join(json.dumps(_jsonable(row), sort_keys=True, default=repr)
                      for row in rows) + "\n"
 
+
+def iter_ort_failures(reports: Iterable[OpReport]):
+    """Yield one machine-readable record per ORT-rejected generated case."""
+    for report in reports:
+        for case_idx, case in enumerate(report.cases):
+            if case.diff is None or not case.diff.truth_error:
+                continue
+            bug_class = case.diff.tensor_diffs[0].bug_class if case.diff.tensor_diffs else "invalid-test-case"
+            yield {
+                "report_op": report.op,
+                "case_index": case_idx,
+                "case": _case_meta(case),
+                "classification": bug_class,
+                "truth_error": case.diff.truth_error,
+                "checker_error": case.diff.spec_error,
+                "checker_passed": case.diff.spec_error is None,
+                "error_family": _error_family(case.diff.truth_error),
+                "timings": _jsonable(case.timings),
+            }
+
+
+def render_ort_failures_jsonl(reports: Iterable[OpReport]) -> str:
+    return "\n".join(json.dumps(_jsonable(row), sort_keys=True, default=repr)
+                     for row in iter_ort_failures(reports)) + "\n"
+
+
+def render_case_ort_failure_jsonl(report_op: str, case: CaseResult) -> str:
+    report = OpReport(op=report_op, cases=[case])
+    rows = list(iter_ort_failures([report]))
+    if not rows:
+        return ""
+    return "\n".join(json.dumps(_jsonable(row), sort_keys=True, default=repr)
+                     for row in rows) + "\n"
+
+
+def iter_profile_rows(reports: Iterable[OpReport]):
+    for report in reports:
+        invalid = len(report.invalid_cases)
+        checker_passed_invalid = sum(
+            1 for c in report.invalid_cases
+            if c.diff is not None and c.diff.spec_error is None
+        )
+        cases = len(report.cases)
+        yield {
+            "op": report.op,
+            "cases": cases,
+            "disagreements": len(report.disagreements),
+            "invalid": invalid,
+            "invalid_checker_passed": checker_passed_invalid,
+            "invalid_checker_failed": invalid - checker_passed_invalid,
+            "build_errors": len(report.build_errors),
+            "valid": cases - invalid,
+            "timings": _jsonable(report.timings),
+        }
+
+
+def render_profile_jsonl(reports: Iterable[OpReport]) -> str:
+    return "\n".join(json.dumps(_jsonable(row), sort_keys=True, default=repr)
+                     for row in iter_profile_rows(reports)) + "\n"
+
 def render_catalog(entries: list[BugEntry]) -> str:
     onnx_tool_bugs = [e for e in entries if e.bug_class in CONFIRMED_BUG_CLASSES]
     onnxruntime_bugs = [e for e in entries if e.bug_class in ONNXRUNTIME_BUG_CLASSES]
@@ -316,18 +379,17 @@ def render_catalog(entries: list[BugEntry]) -> str:
     out.append("")
     out.append("Each test case runs through two oracles:")
     out.append("")
-    out.append("- **`onnxruntime`** executes the model. Validity is decided by "
-               "execution: if ORT runs the model cleanly, it's a model that "
-               "could ship. If ORT rejects it, we ignore the case — "
-               "an unrunnable model can't be submitted to Kaggle and can't "
-               "influence scoring.")
+    out.append("- **`onnxruntime`** executes the model and provides the runtime "
+               "baseline. If ORT rejects a model, there is no shape/type/byte "
+               "baseline for comparing onnx_tool.")
     out.append("- **`onnx_tool`** statically profiles the model.")
     out.append("")
     out.append("Classification:")
     out.append("")
     out.append("| ORT | onnx_tool | classification |")
     out.append("|-----|-----------|----------------|")
-    out.append("| reject | (any) | ignored (generator noise; not recorded here) |")
+    out.append("| reject + checker rejects | (any) | **invalid-test-case** / harness coverage gap |")
+    out.append("| reject + checker accepts | (any) | **ort-rejects-checker-valid-model** / no onnx_tool baseline |")
     out.append("| accept | reject | **onnx-tool-fails-valid-model** |")
     out.append("| accept | accept-but-disagrees | **onnx_tool wrong shape/dtype/bytes** |")
     out.append("")
@@ -537,5 +599,7 @@ def render_full_report(reports: list[OpReport]) -> str:
 __all__ = [
     "BugEntry", "build_catalog", "render_catalog",
     "iter_raw_findings", "render_findings_jsonl", "render_case_findings_jsonl",
+    "iter_ort_failures", "render_ort_failures_jsonl", "render_case_ort_failure_jsonl",
+    "iter_profile_rows", "render_profile_jsonl",
     "render_summary", "render_op", "render_full_report",
 ]

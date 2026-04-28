@@ -7,6 +7,7 @@ import multiprocessing as mp
 import queue as queue_mod
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
@@ -17,6 +18,13 @@ import onnxruntime as ort
 
 from .generators import TestCase, Scenario, generate_single_op
 from .profiles import DEFAULT_OPSET, MAX_CASES_PER_OP, get_spec, list_specs
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"node .* is not registed for profiling.*",
+    category=UserWarning,
+    module=r"onnx_tool\.node",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,7 +100,7 @@ BUG_CLASSES = (
     "missing-tensor", "wrong-shape", "wrong-dtype", "wrong-bytes",
     "scalar-volume", "constant-uncounted",
     "onnx-tool-fails-valid-model", "onnx-tool-timeout-valid-model",
-    "ort-timeout", "invalid-test-case",
+    "ort-timeout", "ort-rejects-checker-valid-model", "invalid-test-case",
 )
 CONFIRMED_BUG_CLASSES = (
     "missing-tensor", "wrong-shape", "wrong-dtype", "wrong-bytes",
@@ -100,7 +108,7 @@ CONFIRMED_BUG_CLASSES = (
     "onnx-tool-timeout-valid-model",
 )
 NOISE_BUG_CLASSES = ("invalid-test-case",)
-ONNXRUNTIME_BUG_CLASSES: tuple[str, ...] = ("ort-timeout",)
+ONNXRUNTIME_BUG_CLASSES: tuple[str, ...] = ("ort-timeout", "ort-rejects-checker-valid-model")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,8 +116,11 @@ ONNXRUNTIME_BUG_CLASSES: tuple[str, ...] = ("ort-timeout",)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _promote_all_outputs(model: onnx.ModelProto) -> onnx.ModelProto:
+    produced = {out for node in model.graph.node for out in node.output if out}
+    already_out = {o.name for o in model.graph.output}
+    if produced <= already_out:
+        return model
     inferred = onnx.shape_inference.infer_shapes(model)
-    produced = {out for node in inferred.graph.node for out in node.output if out}
     already_out = {o.name for o in inferred.graph.output}
     type_map = {vi.name: vi.type for vi in list(inferred.graph.value_info)
                 + list(inferred.graph.output) + list(inferred.graph.input)}
@@ -133,6 +144,8 @@ def run_truth(model: onnx.ModelProto, feeds: dict[str, np.ndarray]) -> TruthResu
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         opts.log_severity_level = 4
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
         sess = ort.InferenceSession(promoted.SerializeToString(), opts)
         outputs = sess.run(None, feeds)
         names = [o.name for o in sess.get_outputs()]
@@ -219,6 +232,38 @@ def _is_constant_output(model: onnx.ModelProto, tensor_name: str) -> bool:
             return True
     return False
 
+def _with_relaxed_graph_output_shapes(model: onnx.ModelProto) -> onnx.ModelProto:
+    relaxed = onnx.ModelProto()
+    relaxed.CopyFrom(model)
+    for out in relaxed.graph.output:
+        tt = out.type.tensor_type
+        if tt.elem_type and not tt.HasField("shape"):
+            tt.shape.CopyFrom(onnx.TensorShapeProto())
+    return relaxed
+
+def _check_model_error(model: onnx.ModelProto) -> str | None:
+    try:
+        onnx.checker.check_model(model)
+        return None
+    except Exception as e:
+        first = f"{type(e).__name__}: {e}"
+    try:
+        onnx.checker.check_model(onnx.shape_inference.infer_shapes(model))
+        return None
+    except Exception as e:
+        second = f"{type(e).__name__}: {e}"
+    try:
+        onnx.checker.check_model(_with_relaxed_graph_output_shapes(model))
+        return None
+    except Exception:
+        pass
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model)
+        onnx.checker.check_model(_with_relaxed_graph_output_shapes(inferred))
+        return None
+    except Exception as e:
+        return f"{first}; after infer_shapes: {second}; after relaxing graph output shapes: {type(e).__name__}: {e}"
+
 def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResult) -> DiffResult:
     """Compare oracle outputs and classify disagreements."""
     res = DiffResult(
@@ -228,8 +273,10 @@ def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResu
         claim_error=claim.error,
     )
     if truth.error:
+        res.spec_error = _check_model_error(model)
+        bug_class = "invalid-test-case" if res.spec_error else "ort-rejects-checker-valid-model"
         res.tensor_diffs.append(TensorDiff(
-            name="<model>", bug_class="invalid-test-case",
+            name="<model>", bug_class=bug_class,
             truth_shape=None, truth_dtype=None, truth_bytes=None,
             claim_shape=None, claim_dtype=None,
             claim_bytes=claim.total_memory if not claim.error else None,
@@ -333,6 +380,7 @@ class CaseResult:
     claim: OnnxToolResult | None
     diff: DiffResult | None
     build_error: str | None = None
+    timings: dict[str, float] = field(default_factory=dict)
 
     @property
     def is_invalid_case(self) -> bool:
@@ -347,6 +395,7 @@ class OpReport:
     op: str
     cases: list[CaseResult] = field(default_factory=list)
     notes: str = ""
+    timings: dict[str, float] = field(default_factory=dict)
 
     @property
     def disagreements(self) -> list[CaseResult]:
@@ -361,22 +410,34 @@ class OpReport:
         return [c for c in self.cases if c.build_error is not None]
 
 def _run_case_impl(tc: TestCase | Scenario, progress=None) -> CaseResult:
+    t_case = time.perf_counter()
+    timings: dict[str, float] = {}
     if tc.model is None:
-        return CaseResult(case=tc, truth=None, claim=None, diff=None, build_error=tc.label)
+        timings["total"] = time.perf_counter() - t_case
+        return CaseResult(case=tc, truth=None, claim=None, diff=None,
+                          build_error=tc.label, timings=timings)
     if progress:
         progress("ort")
+    t = time.perf_counter()
     truth = run_truth(tc.model, tc.feeds)
+    timings["ort"] = time.perf_counter() - t
     if truth.error:
         claim = OnnxToolResult(
             tensor_shapes={}, tensor_dtypes={}, tensor_bytes={},
             node_macs={}, node_memory={}, node_params={},
         )
-        return CaseResult(case=tc, truth=truth, claim=claim, diff=diff_oracles(tc.model, truth, claim))
+        timings["total"] = time.perf_counter() - t_case
+        return CaseResult(case=tc, truth=truth, claim=claim,
+                          diff=diff_oracles(tc.model, truth, claim),
+                          timings=timings)
     if progress:
         progress("onnx_tool")
+    t = time.perf_counter()
     claim = run_onnx_tool(tc.model, tc.feeds)
+    timings["onnx_tool"] = time.perf_counter() - t
     diff = diff_oracles(tc.model, truth, claim)
-    return CaseResult(case=tc, truth=truth, claim=claim, diff=diff)
+    timings["total"] = time.perf_counter() - t_case
+    return CaseResult(case=tc, truth=truth, claim=claim, diff=diff, timings=timings)
 
 
 def _run_case_worker(tc: TestCase | Scenario, q) -> None:
@@ -387,6 +448,7 @@ def _run_case_worker(tc: TestCase | Scenario, q) -> None:
         q.put(("result", CaseResult(
             case=tc, truth=None, claim=None, diff=None,
             build_error=f"HARNESS-ERROR: {type(e).__name__}: {e}",
+            timings={},
         )))
 
 
@@ -403,7 +465,8 @@ def _timeout_result(tc: TestCase | Scenario, phase: str, timeout: float) -> Case
         claim_shape=None, claim_dtype=None, claim_bytes=None,
         note=note,
     )])
-    return CaseResult(case=tc, truth=None, claim=None, diff=diff)
+    return CaseResult(case=tc, truth=None, claim=None, diff=diff,
+                      timings={"total": timeout})
 
 
 def run_case(tc: TestCase | Scenario, *, timeout: float | None = None) -> CaseResult:
@@ -450,6 +513,7 @@ def run_case(tc: TestCase | Scenario, *, timeout: float | None = None) -> CaseRe
     return CaseResult(
         case=tc, truth=None, claim=None, diff=None,
         build_error=f"HARNESS-ERROR: worker exited without result (exitcode={p.exitcode}, phase={phase})",
+        timings={},
     )
 
 
@@ -459,16 +523,122 @@ CaseCallback = Callable[[OpReport, CaseResult], None]
 def run_op(name: str, *, opset: int = DEFAULT_OPSET,
            case_timeout: float | None = None,
            case_limit: int | None = None,
+           case_workers: int = 1,
            on_result: CaseCallback | None = None) -> OpReport:
     """Generate and run all test cases for one operator."""
     spec = get_spec(name, opset=opset)
+    t = time.perf_counter()
     cases = generate_single_op(spec, limit=case_limit or MAX_CASES_PER_OP)
+    gen_seconds = time.perf_counter() - t
     report = OpReport(op=f"{name}@{spec.opset}", notes=spec.notes)
-    for tc in cases:
-        res = run_case(tc, timeout=case_timeout)
-        report.cases.append(res)
-        if on_result:
-            on_result(report, res)
+    report.timings["generate"] = gen_seconds
+
+    t = time.perf_counter()
+    if case_workers > 1 and len(cases) > 1:
+        with ThreadPoolExecutor(max_workers=case_workers) as pool:
+            future_to_tc = {pool.submit(run_case, tc, timeout=case_timeout): tc for tc in cases}
+            for future in as_completed(future_to_tc):
+                try:
+                    res = future.result()
+                except Exception as e:
+                    tc = future_to_tc[future]
+                    res = CaseResult(case=tc, truth=None, claim=None, diff=None,
+                                     build_error=f"HARNESS-ERROR: {type(e).__name__}: {e}")
+                report.cases.append(res)
+                if on_result:
+                    on_result(report, res)
+    else:
+        for tc in cases:
+            res = run_case(tc, timeout=case_timeout)
+            report.cases.append(res)
+            if on_result:
+                on_result(report, res)
+    report.timings["run"] = time.perf_counter() - t
+    report.timings["ort"] = sum(c.timings.get("ort", 0.0) for c in report.cases)
+    report.timings["onnx_tool"] = sum(c.timings.get("onnx_tool", 0.0) for c in report.cases)
+    report.timings["case_total"] = sum(c.timings.get("total", 0.0) for c in report.cases)
+    return report
+
+
+def _run_op_worker(name: str, opset: int, case_timeout: float | None,
+                   case_limit: int | None, case_workers: int, q) -> None:
+    try:
+        q.put(("result", run_op(
+            name, opset=opset, case_timeout=case_timeout,
+            case_limit=case_limit, case_workers=case_workers,
+            on_result=None,
+        )))
+    except Exception as e:
+        report = OpReport(op=f"{name}@{opset}")
+        report.cases.append(CaseResult(
+            case=TestCase(op=name, label=f"HARNESS-ERROR: {type(e).__name__}: {e}",
+                          model=None, feeds={}, input_cases=(), attrs={}),
+            truth=None, claim=None, diff=None,
+            build_error=f"HARNESS-ERROR: {type(e).__name__}: {e}",
+        ))
+        q.put(("result", report))
+
+
+def run_op_with_timeout(name: str, *, opset: int = DEFAULT_OPSET,
+                        op_timeout: float | None = None,
+                        case_timeout: float | None = None,
+                        case_limit: int | None = None,
+                        case_workers: int = 1) -> OpReport:
+    """Run one op in a killable process so a sweep can skip wedged ops."""
+    if op_timeout is None or op_timeout <= 0:
+        return run_op(name, opset=opset, case_timeout=case_timeout,
+                      case_limit=case_limit, case_workers=case_workers)
+
+    q = mp.Queue(maxsize=1)
+    p = mp.Process(target=_run_op_worker,
+                   args=(name, opset, case_timeout, case_limit, case_workers, q))
+    p.start()
+    deadline = time.monotonic() + op_timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            kind, payload = q.get(timeout=min(0.2, remaining))
+        except queue_mod.Empty:
+            if not p.is_alive():
+                break
+            continue
+        if kind == "result":
+            p.join(2)
+            return payload
+
+    if p.is_alive():
+        p.terminate()
+        p.join(2)
+        if p.is_alive():
+            p.kill()
+            p.join(2)
+        report = OpReport(op=f"{name}@{opset}", notes=f"op timed out after {op_timeout:g}s")
+        report.cases.append(CaseResult(
+            case=TestCase(op=name, label=f"OP-TIMEOUT after {op_timeout:g}s",
+                          model=None, feeds={}, input_cases=(), attrs={}),
+            truth=None, claim=None, diff=None,
+            build_error=f"OP-TIMEOUT after {op_timeout:g}s",
+            timings={"total": op_timeout},
+        ))
+        report.timings["run"] = op_timeout
+        return report
+
+    try:
+        kind, payload = q.get_nowait()
+        if kind == "result":
+            return payload
+    except queue_mod.Empty:
+        pass
+
+    report = OpReport(op=f"{name}@{opset}", notes="op worker exited without result")
+    report.cases.append(CaseResult(
+        case=TestCase(op=name, label="OP-HARNESS-ERROR: worker exited without result",
+                      model=None, feeds={}, input_cases=(), attrs={}),
+        truth=None, claim=None, diff=None,
+        build_error=f"OP-HARNESS-ERROR: worker exited without result (exitcode={p.exitcode})",
+    ))
     return report
 
 def run_all(only: Iterable[str] | None = None, *, opset: int = DEFAULT_OPSET,
@@ -508,7 +678,7 @@ def run_dag_phase(*, n_random: int = 100, target_nodes: int = 4, opset: int = 11
 
 __all__ = [
     "TestCase", "CaseResult", "OpReport", "TensorDiff", "DiffResult",
-    "run_case", "run_op", "run_all", "run_dag_phase",
+    "run_case", "run_op", "run_op_with_timeout", "run_all", "run_dag_phase",
     "run_truth", "run_onnx_tool", "diff_oracles",
     "BUG_CLASSES", "CONFIRMED_BUG_CLASSES", "NOISE_BUG_CLASSES",
 ]
