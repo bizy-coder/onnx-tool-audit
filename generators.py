@@ -283,8 +283,6 @@ def build_case(spec: OpSpec, input_cases: tuple[InputCase, ...], attrs: dict, *,
     nodes.append(node)
 
     def output_elem_type(out) -> int:
-        if out.dtype_labels:
-            return onnx_dtype(out.dtype_labels[0])
         for port, case in zip(spec.inputs, (by_name.get(p.name) for p in spec.inputs)):
             if case is not None and out.type_param and out.type_param == port.type_param:
                 return case.onnx_dtype
@@ -292,6 +290,8 @@ def build_case(spec: OpSpec, input_cases: tuple[InputCase, ...], attrs: dict, *,
             return onnx.TensorProto.INT64
         if out.name.lower() in {"mask"}:
             return onnx.TensorProto.BOOL
+        if out.dtype_labels:
+            return onnx_dtype(out.dtype_labels[0])
         return onnx.TensorProto.FLOAT
 
     graph_outputs = [
