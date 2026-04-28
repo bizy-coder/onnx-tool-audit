@@ -151,28 +151,92 @@ def _parse_trigger(label: str) -> tuple[list[tuple[str, str, str, str, str]], st
     return ports, attrs_raw
 
 
-def _format_inputs(ports: list[tuple[str, str, str, str, str]]) -> str:
-    """Render input ports compactly. Joins all ports with ` · ` separator."""
+def _parse_attrs_dict(attrs_raw: str) -> dict:
+    """Best-effort parse of attrs raw string into a dict. Returns {} on failure."""
+    import ast
+    if not attrs_raw or attrs_raw.strip() in ("", "{}"):
+        return {}
+    try:
+        v = ast.literal_eval(attrs_raw)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _analyze_variation(rows: list[dict]) -> tuple[set[tuple[int, str]], set[str]]:
+    """For all rows in a group, find which input port fields and attr keys vary.
+
+    Returns:
+        varying_fields: set of (port_index, field_name) where field_name in {"shape", "dtype", "fill"}
+        varying_attrs: set of attr keys that take more than one value across rows
+    """
+    if not rows or len(rows) < 2:
+        return set(), set()
+
+    parsed = [_parse_trigger((r.get("case", {}) or {}).get("label", "")) for r in rows]
+    n_ports = max(len(p) for p, _ in parsed) if parsed else 0
+
+    varying_fields = set()
+    for i in range(n_ports):
+        shapes, dtypes, fills = set(), set(), set()
+        for ports, _ in parsed:
+            if i < len(ports):
+                shapes.add(ports[i][2])
+                dtypes.add(ports[i][3])
+                fills.add(ports[i][4])
+        if len(shapes) > 1:
+            varying_fields.add((i, "shape"))
+        if len(dtypes) > 1:
+            varying_fields.add((i, "dtype"))
+        if len(fills) > 1:
+            varying_fields.add((i, "fill"))
+
+    varying_attrs = set()
+    attrs_dicts = [_parse_attrs_dict(s) for _, s in parsed]
+    all_keys = set().union(*(d.keys() for d in attrs_dicts)) if attrs_dicts else set()
+    for k in all_keys:
+        vals = {repr(d.get(k)) for d in attrs_dicts}
+        if len(vals) > 1:
+            varying_attrs.add(k)
+    return varying_fields, varying_attrs
+
+
+def _format_inputs(ports: list[tuple[str, str, str, str, str]],
+                   varying_fields: set[tuple[int, str]] = frozenset()) -> str:
+    """Render input ports. Mark varying fields with `*` (means "any value works")."""
     if not ports:
         return "—"
     chunks = []
-    for name, kind, shape, dtype, fill in ports:
+    for i, (name, kind, shape, dtype, fill) in enumerate(ports):
         kind_tag = "" if kind == "input" else " (init)"
-        # e.g. "X: BCHW/f32/random" or "data: 1d-10/i64/zeros (init)"
         d_short = dtype.replace("float", "f").replace("int", "i").replace("uint", "u")
-        chunks.append(f"`{name}`{kind_tag}: {shape}/{d_short}/{fill}")
+        s = f"{shape}\\*" if (i, "shape") in varying_fields else shape
+        d = f"{d_short}\\*" if (i, "dtype") in varying_fields else d_short
+        f = f"{fill}\\*" if (i, "fill") in varying_fields else fill
+        chunks.append(f"`{name}`{kind_tag}: {s}/{d}/{f}")
     return "<br>".join(chunks)
 
 
-def _format_attrs(attrs_raw: str) -> str:
-    """Strip dict braces and quoting noise from attrs string."""
+def _format_attrs(attrs_raw: str, varying_attrs: set[str] = frozenset()) -> str:
+    """Strip dict noise; mark varying keys with `*`."""
     if not attrs_raw or attrs_raw == "{}":
         return "—"
-    s = attrs_raw.strip("{}").strip()
-    # Replace `'key':` with `key=` for compactness
-    s = re.sub(r"'(\w+)':\s*", r"\1=", s)
-    s = re.sub(r"b'([^']*)'", r"\1", s)  # strip bytes prefix
-    return f"`{s}`"
+    d = _parse_attrs_dict(attrs_raw)
+    if not d:
+        # Fall back to old string cleanup
+        s = attrs_raw.strip("{}").strip()
+        s = re.sub(r"'(\w+)':\s*", r"\1=", s)
+        s = re.sub(r"b'([^']*)'", r"\1", s)
+        return f"`{s}`"
+    parts = []
+    for k, v in d.items():
+        if isinstance(v, bytes):
+            v_str = v.decode("utf-8", errors="replace")
+        else:
+            v_str = repr(v) if isinstance(v, str) else str(v)
+        marker = "\\*" if k in varying_attrs else ""
+        parts.append(f"{k}={v_str}{marker}")
+    return f"`{', '.join(parts)}`"
 
 
 def _md_shape(s) -> str:
@@ -246,6 +310,7 @@ class IssueGroup:
     surfaces: int = 0
     case_keys: set[tuple[str, int | str]] = field(default_factory=set)
     trigger_sigs: set[str] = field(default_factory=set)
+    all_rows: list[dict] = field(default_factory=list)
     representative: dict | None = None
     valid_cases: int = 0
 
@@ -254,6 +319,7 @@ class IssueGroup:
         self.surfaces += 1
         self.case_keys.add((row.get("report_op", self.op), row.get("case_index", "?")))
         self.trigger_sigs.add(_trigger_signature(row))
+        self.all_rows.append(row)
         # Keep the simplest row as representative.
         if self.representative is None or _simplicity_score(row) < _simplicity_score(self.representative):
             self.representative = row
@@ -308,13 +374,14 @@ def _row_type(g: IssueGroup) -> list[str]:
     row = g.representative or {}
     case = row.get("case", {})
     ports, attrs_raw = _parse_trigger(case.get("label", ""))
+    varying_fields, varying_attrs = _analyze_variation(g.all_rows)
     truth_dtype = (row.get("truth") or {}).get("dtype")
     claim_dtype = (row.get("claim") or {}).get("dtype")
     return [
         f"`{g.op}`",
         _fmt_opsets(g.opsets),
-        _md_escape(_format_inputs(ports)),
-        _md_escape(_format_attrs(attrs_raw)),
+        _md_escape(_format_inputs(ports, varying_fields)),
+        _md_escape(_format_attrs(attrs_raw, varying_attrs)),
         _kind_cell(g),
         _md_cell(truth_dtype),
         _md_cell(claim_dtype),
@@ -326,14 +393,15 @@ def _row_shape(g: IssueGroup) -> list[str]:
     row = g.representative or {}
     case = row.get("case", {})
     ports, attrs_raw = _parse_trigger(case.get("label", ""))
+    varying_fields, varying_attrs = _analyze_variation(g.all_rows)
     truth = row.get("truth") or {}
     claim = row.get("claim") or {}
     return [
         f"`{g.op}`",
         _fmt_opsets(g.opsets),
         g.family,
-        _md_escape(_format_inputs(ports)),
-        _md_escape(_format_attrs(attrs_raw)),
+        _md_escape(_format_inputs(ports, varying_fields)),
+        _md_escape(_format_attrs(attrs_raw, varying_attrs)),
         _kind_cell(g),
         _md_shape(truth.get("shape")),
         _md_shape(claim.get("shape")),
@@ -345,14 +413,15 @@ def _row_error(g: IssueGroup) -> list[str]:
     row = g.representative or {}
     case = row.get("case", {})
     ports, attrs_raw = _parse_trigger(case.get("label", ""))
+    varying_fields, varying_attrs = _analyze_variation(g.all_rows)
     err = row.get("claim_error") or row.get("note") or ""
     err_short = _md_escape(err.splitlines()[0][:140]) if err else "—"
     return [
         f"`{g.op}`",
         _fmt_opsets(g.opsets),
         g.family,
-        _md_escape(_format_inputs(ports)),
-        _md_escape(_format_attrs(attrs_raw)),
+        _md_escape(_format_inputs(ports, varying_fields)),
+        _md_escape(_format_attrs(attrs_raw, varying_attrs)),
         _kind_cell(g),
         f"`{err_short}`" if err_short != "—" else "—",
         _coverage_cell(len(g.case_keys), g.surfaces, g.valid_cases),
@@ -390,8 +459,10 @@ def render_structured_report(findings_paths: Iterable[Path], profile_paths: Iter
         "**Columns:**",
         "- **Inputs**: each port shown as `name: shape/dtype/fill`. `(init)` marks initializer (constant input).",
         "- **Attrs**: op attributes used in the failing case.",
-        "- **Repro**: `required` if the shown Inputs+Attrs is the only configuration that triggers the bug; "
-        "`example (1/N)` if it's one of N distinct triggering configurations (we show the simplest).",
+        "- **`*` suffix** on any field means it *varies* across triggers — the shown value is just one example "
+        "and other values also reproduce the bug. Unmarked values are required (consistent across all triggers).",
+        "- **Repro**: `required` if a single Inputs+Attrs configuration triggers the bug; "
+        "`example (1/N)` if N distinct configurations trigger it (we show the simplest).",
         "- **Cases**: `hits/valid_cases` — how many ORT-valid configurations onnx_tool got wrong. "
         "Trailing `(N surf)` means N raw findings collapsed into the same group.",
         "",
