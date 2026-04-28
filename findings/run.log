@@ -1,0 +1,98 @@
+Phase 1: running 89 ops...
+  [  1/89] !  Where                          cases= 64 dis= 14 be=  0
+  [  2/89]    Compress                       cases= 64 dis=  0 be=  0
+  [  3/89] !  Constant                       cases=  4 dis=  4 be=  0
+  [  4/89]    ReduceMax                      cases= 64 dis=  0 be=  0
+  [  5/89]    ReduceMin                      cases= 64 dis=  0 be=  0
+  [  6/89]    ReduceSum                      cases= 64 dis=  0 be=  0
+  [  7/89]    ReduceMean                     cases= 64 dis=  0 be=  0
+  [  8/89]    ReduceProd                     cases= 64 dis=  0 be=  0
+  [  9/89]    ReduceL2                       cases= 64 dis=  0 be=  0
+  [ 10/89]    Add                            cases= 64 dis=  0 be=  0
+  [ 11/89]    Mul                            cases= 64 dis=  0 be=  0
+  [ 12/89]    Sub                            cases= 64 dis=  0 be=  0
+  [ 13/89]    Div                            cases= 64 dis=  0 be=  0
+  [ 14/89] !  Pow                            cases= 64 dis=  9 be=  0
+  [ 15/89]    Equal                          cases= 64 dis=  0 be=  0
+  [ 16/89]    Greater                        cases= 64 dis=  0 be=  0
+  [ 17/89]    GreaterOrEqual                 cases= 64 dis=  0 be=  0
+  [ 18/89]    Less                           cases= 64 dis=  0 be=  0
+  [ 19/89]    LessOrEqual                    cases= 64 dis=  0 be=  0
+C:\Users\zydne\AppData\Roaming\Python\Python312\site-packages\onnx_tool\node.py:2827: UserWarning: node NotEqual is not registed for profiling, return 0 Macs and 0 params as default. Use NODEPROFILER_REGISTRY to register your profiler for this node.
+  warnings.warn(f'node {n.op_type} is not registed for profiling, return 0 Macs and 0 params as default. '
+  [ 20/89] !  NotEqual                       cases= 64 dis= 64 be=  0
+  [ 21/89]    Max                            cases= 64 dis=  0 be=  0
+  [ 22/89]    Min                            cases= 64 dis=  0 be=  0
+  [ 23/89] !  Sum                            cases= 64 dis= 13 be=  0
+  [ 24/89]    And                            cases= 64 dis=  0 be=  0
+  [ 25/89]    Or                             cases= 64 dis=  0 be=  0
+  [ 26/89]    Xor                            cases= 64 dis=  0 be=  0
+  [ 27/89] !  Not                            cases=  6 dis=  3 be=  0
+  [ 28/89] !  Identity                       cases= 54 dis= 18 be=  0
+  [ 29/89] !  Relu                           cases= 18 dis=  6 be=  0
+  [ 30/89] !  Sigmoid                        cases= 18 dis=  6 be=  0
+  [ 31/89] !  Tanh                           cases= 18 dis=  6 be=  0
+  [ 32/89] !  Neg                            cases= 18 dis=  6 be=  0
+  [ 33/89] !  Abs                            cases= 18 dis=  6 be=  0
+  [ 34/89] !  Ceil                           cases= 18 dis=  6 be=  0
+  [ 35/89] !  Floor                          cases= 18 dis=  6 be=  0
+  [ 36/89] !  Sqrt                           cases= 18 dis=  6 be=  0
+  [ 37/89] !  Sign                           cases= 18 dis=  6 be=  0
+  [ 38/89] !  Exp                            cases= 18 dis=  6 be=  0
+  [ 39/89] !  Log                            cases= 18 dis=  6 be=  0
+  [ 40/89] !  Erf                            cases= 18 dis=  6 be=  0
+  [ 41/89] !  Reciprocal                     cases= 18 dis=  6 be=  0
+  [ 42/89] !  Elu                            cases= 36 dis= 12 be=  0
+  [ 43/89] !  LeakyRelu                      cases= 36 dis= 12 be=  0
+  [ 44/89] !  HardSigmoid                    cases= 18 dis=  6 be=  0
+  [ 45/89] !  Softplus                       cases= 18 dis=  6 be=  0
+  [ 46/89]    Softmax                        cases= 36 dis=  0 be=  0
+  [ 47/89]    LogSoftmax                     cases= 24 dis=  0 be=  0
+  [ 48/89]    Hardmax                        cases= 12 dis=  0 be=  0
+  [ 49/89] !  Clip                           cases=  3 dis=  3 be=  0
+  [ 50/89]    PRelu                          cases=  3 dis=  0 be=  0
+  [ 51/89]    Cast                           cases= 48 dis=  0 be=  0
+  [ 52/89]    Transpose                      cases= 18 dis=  0 be=  0
+  [ 53/89]    Concat                         cases= 64 dis=  0 be=  0
+  [ 54/89] !  Pad                            cases= 54 dis= 54 be=  0
+  [ 55/89]    Slice                          cases=  6 dis=  0 be=  0
+  [ 56/89]    Gather                         cases=  3 dis=  0 be=  0
+  [ 57/89]    GatherElements                 cases=  3 dis=  0 be=  0
+  [ 58/89]    GatherND                       cases=  3 dis=  0 be=  0
+  [ 59/89]    ScatterElements                cases=  3 dis=  0 be=  0
+  [ 60/89]    Reshape                        cases=  3 dis=  0 be=  0
+  [ 61/89]    Squeeze                        cases= 12 dis=  0 be=  0
+  [ 62/89]    Unsqueeze                      cases= 12 dis=  0 be=  0
+  [ 63/89]    Flatten                        cases=  6 dis=  0 be=  0
+  [ 64/89]    Tile                           cases=  3 dis=  0 be=  0
+  [ 65/89]    Expand                         cases=  3 dis=  0 be=  0
+  [ 66/89]    Split                          cases=  3 dis=  0 be=  0
+  [ 67/89]    DepthToSpace                   cases=  3 dis=  0 be=  0
+  [ 68/89]    Conv                           cases= 12 dis=  0 be=  0
+  [ 69/89]  ? ConvTranspose                  cases=  1 dis=  0 be=  1
+  [ 70/89]    MatMul                         cases=  9 dis=  0 be=  0
+  [ 71/89]    Gemm                           cases=  9 dis=  0 be=  0
+  [ 72/89] !  Einsum                         cases=  9 dis=  9 be=  0
+  [ 73/89]    MaxPool                        cases= 24 dis=  0 be=  0
+  [ 74/89]    AveragePool                    cases= 24 dis=  0 be=  0
+  [ 75/89]    GlobalAveragePool              cases=  3 dis=  0 be=  0
+  [ 76/89]    BatchNormalization             cases=  3 dis=  0 be=  0
+  [ 77/89]    InstanceNormalization          cases=  3 dis=  0 be=  0
+  [ 78/89]    ArgMax                         cases=  6 dis=  0 be=  0
+  [ 79/89]    TopK                           cases=  3 dis=  0 be=  0
+  [ 80/89]  ? OneHot                         cases=  1 dis=  0 be=  1
+  [ 81/89]    Trilu                          cases=  6 dis=  0 be=  0
+  [ 82/89] !  CumSum                         cases=  6 dis=  6 be=  0
+  [ 83/89]    Resize                         cases=  6 dis=  0 be=  0
+  [ 84/89]  ? GridSample                     cases=  1 dis=  0 be=  1
+  [ 85/89] !  Dropout                        cases=  3 dis=  3 be=  0
+  [ 86/89] !  QuantizeLinear                 cases=  3 dis=  3 be=  0
+  [ 87/89] !  DequantizeLinear               cases=  2 dis=  2 be=  0
+  [ 88/89] !  QLinearConv                    cases=  2 dis=  2 be=  0
+  [ 89/89]  ? ScatterND                      cases=  1 dis=  0 be=  1
+Phase 2: running DAG generator (200 random + scenarios)...
+  [DAG] !  DAG                            cases=204 dis=  2 be=  0
+wrote C:\Users\zydne\Desktop\neurogolf\onnx_tool_audit\findings\report.md
+wrote C:\Users\zydne\Desktop\neurogolf\onnx_tool_audit\findings\bugs.md
+  90 ops | 2672 cases | 323 surface findings | 4 build errors
+  bug catalog: 7 distinct confirmed bugs | 3 noise patterns
