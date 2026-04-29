@@ -100,6 +100,8 @@ BUG_CLASSES = (
     "missing-tensor", "wrong-shape", "wrong-dtype", "wrong-bytes",
     "scalar-volume", "constant-uncounted",
     "onnx-tool-fails-valid-model", "onnx-tool-timeout-valid-model",
+    "scorer-wrong-shape", "scorer-wrong-dtype",
+    "scorer-missing-tensor", "scorer-extra-tensor",
     "scorer-memory-undercount", "scorer-memory-overcount",
     "scorer-shape-inference-incomplete", "scorer-rejects-valid-model",
     "ort-timeout", "ort-rejects-checker-valid-model", "invalid-test-case",
@@ -108,6 +110,8 @@ CONFIRMED_BUG_CLASSES = (
     "missing-tensor", "wrong-shape", "wrong-dtype", "wrong-bytes",
     "scalar-volume", "constant-uncounted", "onnx-tool-fails-valid-model",
     "onnx-tool-timeout-valid-model",
+    "scorer-wrong-shape", "scorer-wrong-dtype",
+    "scorer-missing-tensor", "scorer-extra-tensor",
     "scorer-memory-undercount", "scorer-memory-overcount",
     "scorer-shape-inference-incomplete", "scorer-rejects-valid-model",
 )
@@ -270,7 +274,7 @@ def _check_model_error(model: onnx.ModelProto) -> str | None:
 
 def _diff_scorer(model: onnx.ModelProto, truth: TruthResult,
                  feeds: dict[str, np.ndarray] | None = None) -> list[TensorDiff]:
-    """Compare the neurogolf scorer's reported memory to ORT's actual.
+    """Compare the neurogolf scorer's reported memory to ORT's actual, per tensor.
 
     The 2026 NeuroGolf scorer measures memory via onnx.shape_inference instead of
     onnx_tool. Diff that path against ORT to find scorer-vs-reality divergences.
@@ -281,15 +285,9 @@ def _diff_scorer(model: onnx.ModelProto, truth: TruthResult,
     score = score_via_neurogolf(model)
 
     # If the scorer rejects but ORT ran cleanly, that's a blocker bug.
-    # Distinguish failures coming directly from onnx.shape_inference (shape
-    # inference can't pin a static size) from failures that bubble up from
-    # onnx_tool (the indirect path).
     if score.error is not None:
         err = score.error
-        if "shape inference" in err.lower():
-            bug = "scorer-shape-inference-incomplete"
-        else:
-            bug = "scorer-rejects-valid-model"
+        bug = "scorer-shape-inference-incomplete" if "shape inference" in err.lower() else "scorer-rejects-valid-model"
         out.append(TensorDiff(
             name="<scorer>", bug_class=bug,
             truth_shape=None, truth_dtype=None, truth_bytes=truth.total_memory_bytes(),
@@ -298,17 +296,64 @@ def _diff_scorer(model: onnx.ModelProto, truth: TruthResult,
         ))
         return out
 
-    # Compare total scorer-reported memory to ORT-measured tensor memory
-    # (includes feeds, initializers, intermediates; excludes 'input'/'output' names).
-    ort_total, _ = ort_intermediate_memory(truth.all_tensors(), feeds)
-    if score.memory != ort_total:
-        bug = "scorer-memory-undercount" if score.memory < ort_total else "scorer-memory-overcount"
+    # Build ORT per-tensor info: name -> numpy array
+    _, ort_per = ort_intermediate_memory(truth.all_tensors(), feeds)
+    ort_tensors: dict[str, np.ndarray] = {}
+    for src in (feeds or {}, truth.all_tensors()):
+        for name, arr in src.items():
+            if name not in ort_tensors:
+                ort_tensors[name] = arr
+
+    # scorer per-tensor info: name -> {shape, dtype, bytes}
+    si_per = score.tensor_bytes or {}
+
+    all_names = set(ort_per) | set(si_per)
+    has_diff = False
+    for name in sorted(all_names):
+        ort_arr = ort_tensors.get(name)
+        ort_shape = tuple(ort_arr.shape) if ort_arr is not None else None
+        ort_dtype = ort_arr.dtype.name if ort_arr is not None else None
+        ort_bytes = (ort_arr.size * ort_arr.dtype.itemsize) if ort_arr is not None else None
+
+        si = si_per.get(name)
+        si_shape = tuple(si["shape"]) if si else None
+        si_dtype = si["dtype"] if si else None
+        si_bytes = si["bytes"] if si else None
+
+        if name in ort_per and name not in si_per:
+            bug = "scorer-missing-tensor"
+            note = f"shape_inference omits tensor (ORT: shape={ort_shape} dtype={ort_dtype} bytes={ort_bytes})"
+        elif name not in ort_per and name in si_per:
+            bug = "scorer-extra-tensor"
+            note = f"shape_inference counts phantom tensor (SI: shape={si_shape} dtype={si_dtype} bytes={si_bytes})"
+        elif ort_shape != si_shape:
+            bug = "scorer-wrong-shape"
+            note = f"ORT={ort_shape} SI={si_shape}"
+        elif ort_dtype != si_dtype:
+            bug = "scorer-wrong-dtype"
+            note = f"ORT={ort_dtype} SI={si_dtype}"
+        else:
+            continue  # matches
+
+        has_diff = True
         out.append(TensorDiff(
-            name="<scorer-memory>", bug_class=bug,
-            truth_shape=None, truth_dtype=None, truth_bytes=ort_total,
-            claim_shape=None, claim_dtype=None, claim_bytes=score.memory,
-            note=f"scorer={score.memory}B ORT={ort_total}B (excludes graph input/output)",
+            name=name, bug_class=bug,
+            truth_shape=ort_shape, truth_dtype=ort_dtype, truth_bytes=ort_bytes,
+            claim_shape=si_shape, claim_dtype=si_dtype, claim_bytes=si_bytes,
+            note=note,
         ))
+
+    # If no per-tensor breakdown but totals differ, fall back to aggregate diff.
+    if not has_diff:
+        ort_total = sum(ort_per.values())
+        if score.memory != ort_total:
+            bug = "scorer-memory-undercount" if score.memory < ort_total else "scorer-memory-overcount"
+            out.append(TensorDiff(
+                name="<scorer-memory>", bug_class=bug,
+                truth_shape=None, truth_dtype=None, truth_bytes=ort_total,
+                claim_shape=None, claim_dtype=None, claim_bytes=score.memory,
+                note=f"scorer={score.memory}B ORT={ort_total}B",
+            ))
     return out
 
 

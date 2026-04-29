@@ -37,23 +37,24 @@ class ScoreResult:
     memory: int | None
     params: int | None
     error: str | None = None
-    # Per-tensor memory contributions for diffing
-    tensor_bytes: dict[str, int] | None = None
+    # Per-tensor info from shape_inference: name -> {shape, dtype, bytes}
+    tensor_bytes: dict[str, dict] | None = None
 
 
-def calculate_memory(model: onnx.ModelProto) -> tuple[int | None, dict[str, int]]:
+def calculate_memory(model: onnx.ModelProto) -> tuple[int | None, dict[str, dict]]:
     """Reimplements neurogolf_utils.calculate_memory.
 
     Returns:
-        (total_bytes, per_tensor_bytes). Returns (None, {}) if shape inference
-        leaves any dim symbolic (matching the scorer's None return).
+        (total_bytes, per_tensor_info) where per_tensor_info maps name ->
+        {'shape': list[int], 'dtype': str, 'bytes': int}.
+        Returns (None, {}) if shape inference leaves any dim symbolic.
     """
     try:
         graph = onnx.shape_inference.infer_shapes(model, strict_mode=True).graph
     except Exception:
         return None, {}
 
-    per_tensor: dict[str, int] = {}
+    per_tensor: dict[str, dict] = {}
     total = 0
     for item in list(graph.input) + list(graph.value_info) + list(graph.output):
         if not item.type.HasField("tensor_type"):
@@ -61,19 +62,20 @@ def calculate_memory(model: onnx.ModelProto) -> tuple[int | None, dict[str, int]
         tt = item.type.tensor_type
         if not tt.HasField("shape"):
             return None, {}
-        n = 1
+        shape = []
         for dim in tt.shape.dim:
             if dim.HasField("dim_param") or not dim.HasField("dim_value"):
                 return None, {}
-            n *= dim.dim_value
+            shape.append(dim.dim_value)
         if item.name in _EXCLUDED_TENSOR_NAMES:
             continue
         try:
             np_dt = onnx.helper.tensor_dtype_to_np_dtype(tt.elem_type)
         except Exception:
             continue
+        n = int(np.prod(shape)) if shape else 1
         bytes_ = n * np.dtype(np_dt).itemsize
-        per_tensor[item.name] = bytes_
+        per_tensor[item.name] = {"shape": shape, "dtype": np.dtype(np_dt).name, "bytes": bytes_}
         total += bytes_
     return total, per_tensor
 

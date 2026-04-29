@@ -19,6 +19,8 @@ SHAPE_CLASSES = {"wrong-shape", "wrong-bytes", "scalar-volume", "missing-tensor"
 # Bugs caused directly by `onnx.shape_inference` — what the new scorer relies on
 # for the memory total (independent of onnx_tool's MAC inference).
 SHAPE_INFERENCE_CLASSES = {
+    "scorer-wrong-shape", "scorer-wrong-dtype",
+    "scorer-missing-tensor", "scorer-extra-tensor",
     "scorer-memory-undercount", "scorer-memory-overcount",
     "scorer-shape-inference-incomplete",
 }
@@ -100,6 +102,19 @@ def _family(row: dict) -> str:
         return f"{row.get('truth', {}).get('dtype')} → {row.get('claim', {}).get('dtype')}"
     if klass in SHAPE_CLASSES:
         return _shape_family(row)
+    if klass == "scorer-wrong-shape":
+        truth, claim = row.get("truth", {}), row.get("claim", {})
+        ts, cs = truth.get("shape"), claim.get("shape")
+        tv, cv = _product(ts), _product(cs)
+        if tv is not None and cv is not None:
+            return "shape overcount" if cv > tv else "shape undercount"
+        return "wrong shape"
+    if klass == "scorer-wrong-dtype":
+        return f"{row.get('truth', {}).get('dtype')} → {row.get('claim', {}).get('dtype')}"
+    if klass == "scorer-missing-tensor":
+        return "tensor missing from shape_inference"
+    if klass == "scorer-extra-tensor":
+        return "phantom tensor in shape_inference"
     if klass in ERROR_CLASSES:
         return _error_family(row.get("claim_error") or row.get("note"))
     return klass
