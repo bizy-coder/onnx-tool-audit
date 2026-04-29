@@ -2,51 +2,55 @@
 
 Each test case runs through two oracles:
 
-- **`onnxruntime`** executes the model. Validity is decided by execution: if ORT runs the model cleanly, it's a model that could ship. If ORT rejects it, we ignore the case — an unrunnable model can't be submitted to Kaggle and can't influence scoring.
+- **`onnxruntime`** executes the model and provides the runtime baseline. If ORT rejects a model, there is no shape/type/byte baseline for comparing onnx_tool.
 - **`onnx_tool`** statically profiles the model.
 
 Classification:
 
 | ORT | onnx_tool | classification |
 |-----|-----------|----------------|
-| reject | (any) | **invalid-test-case** (noise — model unrunnable) |
+| reject + checker rejects | (any) | **invalid-test-case** / harness coverage gap |
+| reject + checker accepts | (any) | **ort-rejects-checker-valid-model** / no onnx_tool baseline |
 | accept | reject | **onnx-tool-fails-valid-model** |
 | accept | accept-but-disagrees | **onnx_tool wrong shape/dtype/bytes** |
 
-**Summary**: 2 distinct onnx_tool bugs (2 surface findings collapsed) | 0 noise patterns (0 surface findings ignored).
+**Summary**: 2 distinct onnx_tool bugs (271 surface findings collapsed).
 
 ## Bugs in onnx_tool
 
-### Bug 1: `constant-uncounted`
+### Bug 1: `scorer-wrong-shape`
 
-_Constant node outputs are tracked at the per-tensor level but not added to per-node memory; the model total under-reports by the constant's size._
+_(no explanation)_
 
-- **Affected ops** (1): `DAG`
-- **Surface findings collapsed**: 1
+- **Affected ops** (1): `BatchNormalization@11`
+- **Surface findings collapsed**: 260
 - **Minimal repro**:
 
-  Op: `DAG-scenario`  
+  Op: `BatchNormalization`  
+  Inputs: `X(input)=B-1-H-1/float16/random scale(input)=1d-1/float16/random B(input)=1d-1/float16/random mean(input)=1d-1/float16/random var(input)=1d-1/float16/random {'epsilon': 0.0, 'momentum': 0.0} outputs=11111`  
+  Attrs: `{'epsilon': 0.0, 'momentum': 0.0}`  
 
   | what     | shape | dtype | bytes |
   |----------|-------|-------|-------|
-  | truth    | `(1, 10, 30, 30)` | `float32` | `36000` |
-  | onnx_tool| `(1, 10, 30, 30)` | `float32` | `36000` |
+  | truth    | `(1,)` | `float16` | `2` |
+  | onnx_tool| `(1, 1, 30, 1)` | `float16` | `60` |
 
-  _node  memory=0 ignores produced tensor (true=36000B)_
+  _ORT=(1,) SI=(1, 1, 30, 1)_
 
-### Bug 2: `wrong-shape`
+### Bug 2: `scorer-missing-tensor`
 
-_onnx_tool's static shape inference disagrees with the runtime shape produced by ORT execution._
+_(no explanation)_
 
-- **Affected ops** (1): `DAG`
-- **Surface findings collapsed**: 1
+- **Affected ops** (1): `Clip@11`
+- **Surface findings collapsed**: 11
 - **Minimal repro**:
 
-  Op: `DAG-scenario`  
+  Op: `Clip`  
+  Inputs: `input(input)=scalar/float16/random min(init)=scalar/float16/random max(init)=scalar/float16/random  outputs=1`  
 
   | what     | shape | dtype | bytes |
   |----------|-------|-------|-------|
-  | truth    | `(1, 5, 30, 30)` | `float32` | `18000` |
-  | onnx_tool| `(1, 0, 30, 30)` | `float32` | `0` |
+  | truth    | `()` | `float16` | `2` |
+  | onnx_tool| `None` | `None` | `None` |
 
-  _truth=(1, 5, 30, 30) claim=(1, 0, 30, 30)_
+  _shape_inference omits tensor (ORT: shape=() dtype=float16 bytes=2)_

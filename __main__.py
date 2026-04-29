@@ -159,8 +159,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Phase 1: single-op sweep
     if not args.dag_only:
+        skip_set = set(args.skip or [])
         specs = list_specs(only=op_filter, opset=args.opset) if op_filter else list_specs(opset=args.opset)
-        specs = [s for s in specs if s.name != "DAG"]
+        specs = [s for s in specs if s.name != "DAG" and s.name not in skip_set]
         workers = args.workers
         case_workers = args.case_workers
         print(f"Phase 1: running {len(specs)} ops at opset {args.opset} "
@@ -379,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="number of cases to run in parallel within each op (default 1)")
     p_run.add_argument("--profile", action="store_true",
                        help="print per-op generation/ORT/onnx_tool timing while running")
+    p_run.add_argument("--skip", nargs="*", metavar="OP",
+                       help="op names to skip entirely (e.g. --skip ConvTranspose RNN)")
     p_run.add_argument("--compare", default="both",
                        choices=["onnx_tool", "scorer", "both"],
                        help="which oracle to diff against ORT: onnx_tool, scorer (onnx.shape_inference memory path), or both (default)")
