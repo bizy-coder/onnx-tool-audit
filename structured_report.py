@@ -16,7 +16,17 @@ from typing import Iterable
 
 TYPE_CLASSES = {"wrong-dtype"}
 SHAPE_CLASSES = {"wrong-shape", "wrong-bytes", "scalar-volume", "missing-tensor", "constant-uncounted"}
-ERROR_CLASSES = {"onnx-tool-fails-valid-model", "onnx-tool-timeout-valid-model"}
+# Bugs caused directly by `onnx.shape_inference` — what the new scorer relies on
+# for the memory total (independent of onnx_tool's MAC inference).
+SHAPE_INFERENCE_CLASSES = {
+    "scorer-memory-undercount", "scorer-memory-overcount",
+    "scorer-shape-inference-incomplete",
+}
+# Bugs from onnx_tool's path: validity gate, timeouts, op rejection, etc.
+ERROR_CLASSES = {
+    "onnx-tool-fails-valid-model", "onnx-tool-timeout-valid-model",
+    "scorer-rejects-valid-model",
+}
 
 
 def _read_jsonl(paths: Iterable[Path]) -> Iterable[dict]:
@@ -100,6 +110,8 @@ def _category(klass: str) -> str | None:
         return "Incorrect Type"
     if klass in SHAPE_CLASSES:
         return "Incorrect Shape"
+    if klass in SHAPE_INFERENCE_CLASSES:
+        return "Shape Inference (memory)"
     if klass in ERROR_CLASSES:
         return "Incorrect Errors"
     return None
@@ -354,7 +366,12 @@ def build_structured_groups(findings_paths: Iterable[Path], profile_paths: Itera
     for g in groups.values():
         g.valid_cases = sum(profiles.get((g.op, opset), 0) for opset in g.opsets)
 
-    order = {"Incorrect Type": 0, "Incorrect Shape": 1, "Incorrect Errors": 2}
+    order = {
+        "Incorrect Type": 0,
+        "Incorrect Shape": 1,
+        "Shape Inference (memory)": 2,
+        "Incorrect Errors": 3,
+    }
     return sorted(groups.values(), key=lambda g: (order[g.category], g.family, g.op, _fmt_opsets(g.opsets), -g.surfaces))
 
 
@@ -409,6 +426,26 @@ def _row_shape(g: IssueGroup) -> list[str]:
     ]
 
 
+def _row_shape_inference(g: IssueGroup) -> list[str]:
+    row = g.representative or {}
+    case = row.get("case", {})
+    ports, attrs_raw = _parse_trigger(case.get("label", ""))
+    varying_fields, varying_attrs = _analyze_variation(g.all_rows)
+    truth_bytes = (row.get("truth") or {}).get("bytes")
+    claim_bytes = (row.get("claim") or {}).get("bytes")
+    return [
+        f"`{g.op}`",
+        _fmt_opsets(g.opsets),
+        g.family,
+        _md_escape(_format_inputs(ports, varying_fields)),
+        _md_escape(_format_attrs(attrs_raw, varying_attrs)),
+        _kind_cell(g),
+        _md_cell(truth_bytes),
+        _md_cell(claim_bytes),
+        _coverage_cell(len(g.case_keys), g.surfaces, g.valid_cases),
+    ]
+
+
 def _row_error(g: IssueGroup) -> list[str]:
     row = g.representative or {}
     case = row.get("case", {})
@@ -448,13 +485,14 @@ def render_structured_report(findings_paths: Iterable[Path], profile_paths: Iter
     n_total = len(groups)
     n_type = len(by_cat["Incorrect Type"])
     n_shape = len(by_cat["Incorrect Shape"])
+    n_si = len(by_cat["Shape Inference (memory)"])
     n_err = len(by_cat["Incorrect Errors"])
 
     lines = [
         "# Structured onnx_tool issue report",
         "",
         f"Confirmed divergences vs. ORT, grouped by `(op, family, opsets)`. "
-        f"**{n_total} issues**: {n_type} type, {n_shape} shape, {n_err} error.",
+        f"**{n_total} issues**: {n_type} type, {n_shape} shape, {n_si} shape-inference (memory), {n_err} error.",
         "",
         "**Columns:**",
         "- **Inputs**: each port shown as `name: shape/dtype/fill`. `(init)` marks initializer (constant input).",
@@ -465,6 +503,11 @@ def render_structured_report(findings_paths: Iterable[Path], profile_paths: Iter
         "`example (1/N)` if N distinct configurations trigger it (we show the simplest).",
         "- **Cases**: `hits/valid_cases` — how many ORT-valid configurations onnx_tool got wrong. "
         "Trailing `(N surf)` means N raw findings collapsed into the same group.",
+        "",
+        "**Sections:** *Incorrect Type* and *Incorrect Shape* are bugs in `onnx_tool`'s static profiler "
+        "(impact MAC counting). *Shape Inference (memory)* is bugs that come **directly from "
+        "`onnx.shape_inference`** — these affect the new scorer's `calculate_memory()` total even after "
+        "the metric migration. *Incorrect Errors* covers cases where the scorer rejects an ORT-runnable model.",
         "",
     ]
 
@@ -482,10 +525,17 @@ def render_structured_report(findings_paths: Iterable[Path], profile_paths: Iter
         [_row_shape(g) for g in by_cat["Incorrect Shape"]],
     )
 
+    # Shape Inference (memory) — direct onnx.shape_inference bugs
+    lines += ["## Shape Inference (memory)", ""]
+    lines += _table(
+        ["Op", "Opsets", "Family", "Inputs", "Attrs", "Repro", "ORT bytes", "scorer bytes", "Cases"],
+        [_row_shape_inference(g) for g in by_cat["Shape Inference (memory)"]],
+    )
+
     # Incorrect Errors
     lines += ["## Incorrect Errors", ""]
     lines += _table(
-        ["Op", "Opsets", "Family", "Inputs", "Attrs", "Repro", "onnx_tool error", "Cases"],
+        ["Op", "Opsets", "Family", "Inputs", "Attrs", "Repro", "scorer error", "Cases"],
         [_row_error(g) for g in by_cat["Incorrect Errors"]],
     )
 

@@ -100,14 +100,16 @@ BUG_CLASSES = (
     "missing-tensor", "wrong-shape", "wrong-dtype", "wrong-bytes",
     "scalar-volume", "constant-uncounted",
     "onnx-tool-fails-valid-model", "onnx-tool-timeout-valid-model",
-    "scorer-memory-undercount", "scorer-memory-overcount", "scorer-rejects-valid-model",
+    "scorer-memory-undercount", "scorer-memory-overcount",
+    "scorer-shape-inference-incomplete", "scorer-rejects-valid-model",
     "ort-timeout", "ort-rejects-checker-valid-model", "invalid-test-case",
 )
 CONFIRMED_BUG_CLASSES = (
     "missing-tensor", "wrong-shape", "wrong-dtype", "wrong-bytes",
     "scalar-volume", "constant-uncounted", "onnx-tool-fails-valid-model",
     "onnx-tool-timeout-valid-model",
-    "scorer-memory-undercount", "scorer-memory-overcount", "scorer-rejects-valid-model",
+    "scorer-memory-undercount", "scorer-memory-overcount",
+    "scorer-shape-inference-incomplete", "scorer-rejects-valid-model",
 )
 NOISE_BUG_CLASSES = ("invalid-test-case",)
 ONNXRUNTIME_BUG_CLASSES: tuple[str, ...] = ("ort-timeout", "ort-rejects-checker-valid-model")
@@ -279,12 +281,20 @@ def _diff_scorer(model: onnx.ModelProto, truth: TruthResult,
     score = score_via_neurogolf(model)
 
     # If the scorer rejects but ORT ran cleanly, that's a blocker bug.
+    # Distinguish failures coming directly from onnx.shape_inference (shape
+    # inference can't pin a static size) from failures that bubble up from
+    # onnx_tool (the indirect path).
     if score.error is not None:
+        err = score.error
+        if "shape inference" in err.lower():
+            bug = "scorer-shape-inference-incomplete"
+        else:
+            bug = "scorer-rejects-valid-model"
         out.append(TensorDiff(
-            name="<scorer>", bug_class="scorer-rejects-valid-model",
+            name="<scorer>", bug_class=bug,
             truth_shape=None, truth_dtype=None, truth_bytes=truth.total_memory_bytes(),
             claim_shape=None, claim_dtype=None, claim_bytes=None,
-            note=f"ORT executed cleanly; scorer: {score.error[:200]}",
+            note=f"ORT executed cleanly; scorer: {err[:200]}",
         ))
         return out
 
@@ -303,8 +313,14 @@ def _diff_scorer(model: onnx.ModelProto, truth: TruthResult,
 
 
 def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResult,
-                 feeds: dict[str, np.ndarray] | None = None) -> DiffResult:
-    """Compare oracle outputs and classify disagreements."""
+                 feeds: dict[str, np.ndarray] | None = None,
+                 compare: str = "both") -> DiffResult:
+    """Compare oracle outputs and classify disagreements.
+
+    compare: "onnx_tool" — only onnx_tool vs ORT diffs
+             "scorer"    — only scorer (onnx.shape_inference) vs ORT diffs
+             "both"      — both (default)
+    """
     res = DiffResult(
         truth_total_bytes=truth.total_memory_bytes(),
         claim_total_bytes=claim.total_memory,
@@ -322,20 +338,23 @@ def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResu
             note=f"ORT rejected: {truth.error[:200]}",
         ))
         return res
-    if claim.error:
+    if claim.error and compare != "scorer":
         res.tensor_diffs.append(TensorDiff(
             name="<model>", bug_class="onnx-tool-fails-valid-model",
             truth_shape=None, truth_dtype=None, truth_bytes=truth.total_memory_bytes(),
             claim_shape=None, claim_dtype=None, claim_bytes=None,
             note=f"ORT executed cleanly; onnx_tool: {claim.error[:200]}",
         ))
-        # Even when onnx_tool errors, we still want to know if the scorer (which
-        # uses onnx.shape_inference for memory + onnx_tool for MACs) rejects.
-        res.tensor_diffs.extend(_diff_scorer(model, truth, feeds))
+        if compare in ("scorer", "both"):
+            res.tensor_diffs.extend(_diff_scorer(model, truth, feeds))
         return res
 
     truth_tensors = truth.all_tensors()
-    all_names = set(truth_tensors.keys()) | set(claim.tensor_shapes.keys())
+
+    if compare in ("onnx_tool", "both"):
+        all_names = set(truth_tensors.keys()) | set(claim.tensor_shapes.keys())
+    else:
+        all_names = set()
 
     for name in sorted(all_names):
         true_arr = truth_tensors.get(name)
@@ -387,29 +406,31 @@ def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResu
                 note=note,
             ))
 
-    for node in model.graph.node:
-        if node.op_type != "Constant":
-            continue
-        node_mem = claim.node_memory.get(node.name, 0)
-        for out in node.output:
-            if out not in truth_tensors:
+    if compare in ("onnx_tool", "both"):
+        for node in model.graph.node:
+            if node.op_type != "Constant":
                 continue
-            true_arr = truth_tensors[out]
-            true_b = int(true_arr.size) * true_arr.dtype.itemsize
-            tensor_b = claim.tensor_bytes.get(out, 0) or 0
-            already_flagged = any(d.name == out for d in res.tensor_diffs)
-            if node_mem == 0 and true_b > 0 and not already_flagged:
-                res.tensor_diffs.append(TensorDiff(
-                    name=out, bug_class="constant-uncounted",
-                    truth_shape=tuple(true_arr.shape), truth_dtype=true_arr.dtype.name, truth_bytes=true_b,
-                    claim_shape=claim.tensor_shapes.get(out),
-                    claim_dtype=claim.tensor_dtypes.get(out),
-                    claim_bytes=tensor_b,
-                    note=f"node {node.name} memory=0 ignores produced tensor (true={true_b}B)",
-                ))
+            node_mem = claim.node_memory.get(node.name, 0)
+            for out in node.output:
+                if out not in truth_tensors:
+                    continue
+                true_arr = truth_tensors[out]
+                true_b = int(true_arr.size) * true_arr.dtype.itemsize
+                tensor_b = claim.tensor_bytes.get(out, 0) or 0
+                already_flagged = any(d.name == out for d in res.tensor_diffs)
+                if node_mem == 0 and true_b > 0 and not already_flagged:
+                    res.tensor_diffs.append(TensorDiff(
+                        name=out, bug_class="constant-uncounted",
+                        truth_shape=tuple(true_arr.shape), truth_dtype=true_arr.dtype.name, truth_bytes=true_b,
+                        claim_shape=claim.tensor_shapes.get(out),
+                        claim_dtype=claim.tensor_dtypes.get(out),
+                        claim_bytes=tensor_b,
+                        note=f"node {node.name} memory=0 ignores produced tensor (true={true_b}B)",
+                    ))
 
     # Compare the new neurogolf scorer's memory path (onnx.shape_inference) against ORT.
-    res.tensor_diffs.extend(_diff_scorer(model, truth, feeds))
+    if compare in ("scorer", "both"):
+        res.tensor_diffs.extend(_diff_scorer(model, truth, feeds))
 
     return res
 
@@ -454,7 +475,7 @@ class OpReport:
     def build_errors(self) -> list[CaseResult]:
         return [c for c in self.cases if c.build_error is not None]
 
-def _run_case_impl(tc: TestCase | Scenario, progress=None) -> CaseResult:
+def _run_case_impl(tc: TestCase | Scenario, progress=None, compare: str = "both") -> CaseResult:
     t_case = time.perf_counter()
     timings: dict[str, float] = {}
     if tc.model is None:
@@ -473,22 +494,29 @@ def _run_case_impl(tc: TestCase | Scenario, progress=None) -> CaseResult:
         )
         timings["total"] = time.perf_counter() - t_case
         return CaseResult(case=tc, truth=truth, claim=claim,
-                          diff=diff_oracles(tc.model, truth, claim),
+                          diff=diff_oracles(tc.model, truth, claim, compare=compare),
                           timings=timings)
     if progress:
         progress("onnx_tool")
-    t = time.perf_counter()
-    claim = run_onnx_tool(tc.model, tc.feeds)
-    timings["onnx_tool"] = time.perf_counter() - t
-    diff = diff_oracles(tc.model, truth, claim, tc.feeds)
+    # Skip onnx_tool entirely when only testing the scorer.
+    if compare == "scorer":
+        claim = OnnxToolResult(
+            tensor_shapes={}, tensor_dtypes={}, tensor_bytes={},
+            node_macs={}, node_memory={}, node_params={},
+        )
+    else:
+        t = time.perf_counter()
+        claim = run_onnx_tool(tc.model, tc.feeds)
+        timings["onnx_tool"] = time.perf_counter() - t
+    diff = diff_oracles(tc.model, truth, claim, tc.feeds, compare=compare)
     timings["total"] = time.perf_counter() - t_case
     return CaseResult(case=tc, truth=truth, claim=claim, diff=diff, timings=timings)
 
 
-def _run_case_worker(tc: TestCase | Scenario, q) -> None:
+def _run_case_worker(tc: TestCase | Scenario, q, compare: str = "both") -> None:
     try:
         q.put(("phase", "start"))
-        q.put(("result", _run_case_impl(tc, progress=lambda phase: q.put(("phase", phase)))))
+        q.put(("result", _run_case_impl(tc, progress=lambda phase: q.put(("phase", phase)), compare=compare)))
     except Exception as e:
         q.put(("result", CaseResult(
             case=tc, truth=None, claim=None, diff=None,
@@ -514,13 +542,19 @@ def _timeout_result(tc: TestCase | Scenario, phase: str, timeout: float) -> Case
                       timings={"total": timeout})
 
 
-def run_case(tc: TestCase | Scenario, *, timeout: float | None = None) -> CaseResult:
-    """Run a single test case and compare oracles, optionally with a hard timeout."""
+def run_case(tc: TestCase | Scenario, *, timeout: float | None = None,
+             compare: str = "both") -> CaseResult:
+    """Run a single test case and compare oracles, optionally with a hard timeout.
+
+    compare: "onnx_tool" — only onnx_tool vs ORT
+             "scorer"    — only scorer (onnx.shape_inference) vs ORT
+             "both"      — both (default)
+    """
     if timeout is None or timeout <= 0:
-        return _run_case_impl(tc)
+        return _run_case_impl(tc, compare=compare)
 
     q = mp.Queue(maxsize=1)
-    p = mp.Process(target=_run_case_worker, args=(tc, q))
+    p = mp.Process(target=_run_case_worker, args=(tc, q, compare))
     p.start()
     deadline = time.monotonic() + timeout
     phase = "start"
@@ -569,6 +603,7 @@ def run_op(name: str, *, opset: int = DEFAULT_OPSET,
            case_timeout: float | None = None,
            case_limit: int | None = None,
            case_workers: int = 1,
+           compare: str = "both",
            on_result: CaseCallback | None = None) -> OpReport:
     """Generate and run all test cases for one operator."""
     spec = get_spec(name, opset=opset)
@@ -581,7 +616,7 @@ def run_op(name: str, *, opset: int = DEFAULT_OPSET,
     t = time.perf_counter()
     if case_workers > 1 and len(cases) > 1:
         with ThreadPoolExecutor(max_workers=case_workers) as pool:
-            future_to_tc = {pool.submit(run_case, tc, timeout=case_timeout): tc for tc in cases}
+            future_to_tc = {pool.submit(run_case, tc, timeout=case_timeout, compare=compare): tc for tc in cases}
             for future in as_completed(future_to_tc):
                 try:
                     res = future.result()
@@ -594,7 +629,7 @@ def run_op(name: str, *, opset: int = DEFAULT_OPSET,
                     on_result(report, res)
     else:
         for tc in cases:
-            res = run_case(tc, timeout=case_timeout)
+            res = run_case(tc, timeout=case_timeout, compare=compare)
             report.cases.append(res)
             if on_result:
                 on_result(report, res)
@@ -606,12 +641,13 @@ def run_op(name: str, *, opset: int = DEFAULT_OPSET,
 
 
 def _run_op_worker(name: str, opset: int, case_timeout: float | None,
-                   case_limit: int | None, case_workers: int, q) -> None:
+                   case_limit: int | None, case_workers: int, q,
+                   compare: str = "both") -> None:
     try:
         q.put(("result", run_op(
             name, opset=opset, case_timeout=case_timeout,
             case_limit=case_limit, case_workers=case_workers,
-            on_result=None,
+            compare=compare, on_result=None,
         )))
     except Exception as e:
         report = OpReport(op=f"{name}@{opset}")
@@ -628,15 +664,16 @@ def run_op_with_timeout(name: str, *, opset: int = DEFAULT_OPSET,
                         op_timeout: float | None = None,
                         case_timeout: float | None = None,
                         case_limit: int | None = None,
-                        case_workers: int = 1) -> OpReport:
+                        case_workers: int = 1,
+                        compare: str = "both") -> OpReport:
     """Run one op in a killable process so a sweep can skip wedged ops."""
     if op_timeout is None or op_timeout <= 0:
         return run_op(name, opset=opset, case_timeout=case_timeout,
-                      case_limit=case_limit, case_workers=case_workers)
+                      case_limit=case_limit, case_workers=case_workers, compare=compare)
 
     q = mp.Queue(maxsize=1)
     p = mp.Process(target=_run_op_worker,
-                   args=(name, opset, case_timeout, case_limit, case_workers, q))
+                   args=(name, opset, case_timeout, case_limit, case_workers, q, compare))
     p.start()
     deadline = time.monotonic() + op_timeout
     while True:
@@ -689,6 +726,7 @@ def run_op_with_timeout(name: str, *, opset: int = DEFAULT_OPSET,
 def run_all(only: Iterable[str] | None = None, *, opset: int = DEFAULT_OPSET,
             case_timeout: float | None = None,
             case_limit: int | None = None,
+            compare: str = "both",
             on_result: CaseCallback | None = None) -> list[OpReport]:
     """Generate and run all test cases for multiple operators."""
     reports = []
@@ -696,6 +734,7 @@ def run_all(only: Iterable[str] | None = None, *, opset: int = DEFAULT_OPSET,
         reports.append(run_op(spec.name, opset=opset,
                               case_timeout=case_timeout,
                               case_limit=case_limit,
+                              compare=compare,
                               on_result=on_result))
     return reports
 

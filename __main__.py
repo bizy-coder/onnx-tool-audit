@@ -178,11 +178,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                         case_timeout=args.case_timeout,
                         case_limit=args.case_limit,
                         case_workers=case_workers,
+                        compare=args.compare,
                     )
                 return run_op(spec.name, opset=args.opset,
                               case_timeout=args.case_timeout,
                               case_limit=args.case_limit,
                               case_workers=case_workers,
+                              compare=args.compare,
                               on_result=on_case_result)
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -212,12 +214,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                             case_timeout=args.case_timeout,
                             case_limit=args.case_limit,
                             case_workers=case_workers,
+                            compare=args.compare,
                         )
                     else:
                         r = run_op(spec.name, opset=args.opset,
                                    case_timeout=args.case_timeout,
                                    case_limit=args.case_limit,
                                    case_workers=case_workers,
+                                   compare=args.compare,
                                    on_result=on_case_result)
                 except Exception as e:
                     print(f"  {label} {spec.name}: HARNESS-ERROR: {type(e).__name__}: {e}",
@@ -375,6 +379,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="number of cases to run in parallel within each op (default 1)")
     p_run.add_argument("--profile", action="store_true",
                        help="print per-op generation/ORT/onnx_tool timing while running")
+    p_run.add_argument("--compare", default="both",
+                       choices=["onnx_tool", "scorer", "both"],
+                       help="which oracle to diff against ORT: onnx_tool, scorer (onnx.shape_inference memory path), or both (default)")
     p_run.set_defaults(func=cmd_run)
 
     p_verify = sub.add_parser("verify", help="smoke-test against known bugs")
