@@ -100,12 +100,14 @@ BUG_CLASSES = (
     "missing-tensor", "wrong-shape", "wrong-dtype", "wrong-bytes",
     "scalar-volume", "constant-uncounted",
     "onnx-tool-fails-valid-model", "onnx-tool-timeout-valid-model",
+    "scorer-memory-undercount", "scorer-memory-overcount", "scorer-rejects-valid-model",
     "ort-timeout", "ort-rejects-checker-valid-model", "invalid-test-case",
 )
 CONFIRMED_BUG_CLASSES = (
     "missing-tensor", "wrong-shape", "wrong-dtype", "wrong-bytes",
     "scalar-volume", "constant-uncounted", "onnx-tool-fails-valid-model",
     "onnx-tool-timeout-valid-model",
+    "scorer-memory-undercount", "scorer-memory-overcount", "scorer-rejects-valid-model",
 )
 NOISE_BUG_CLASSES = ("invalid-test-case",)
 ONNXRUNTIME_BUG_CLASSES: tuple[str, ...] = ("ort-timeout", "ort-rejects-checker-valid-model")
@@ -264,7 +266,44 @@ def _check_model_error(model: onnx.ModelProto) -> str | None:
     except Exception as e:
         return f"{first}; after infer_shapes: {second}; after relaxing graph output shapes: {type(e).__name__}: {e}"
 
-def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResult) -> DiffResult:
+def _diff_scorer(model: onnx.ModelProto, truth: TruthResult,
+                 feeds: dict[str, np.ndarray] | None = None) -> list[TensorDiff]:
+    """Compare the neurogolf scorer's reported memory to ORT's actual.
+
+    The 2026 NeuroGolf scorer measures memory via onnx.shape_inference instead of
+    onnx_tool. Diff that path against ORT to find scorer-vs-reality divergences.
+    """
+    from .scorer import score_via_neurogolf, ort_intermediate_memory
+
+    out: list[TensorDiff] = []
+    score = score_via_neurogolf(model)
+
+    # If the scorer rejects but ORT ran cleanly, that's a blocker bug.
+    if score.error is not None:
+        out.append(TensorDiff(
+            name="<scorer>", bug_class="scorer-rejects-valid-model",
+            truth_shape=None, truth_dtype=None, truth_bytes=truth.total_memory_bytes(),
+            claim_shape=None, claim_dtype=None, claim_bytes=None,
+            note=f"ORT executed cleanly; scorer: {score.error[:200]}",
+        ))
+        return out
+
+    # Compare total scorer-reported memory to ORT-measured tensor memory
+    # (includes feeds, initializers, intermediates; excludes 'input'/'output' names).
+    ort_total, _ = ort_intermediate_memory(truth.all_tensors(), feeds)
+    if score.memory != ort_total:
+        bug = "scorer-memory-undercount" if score.memory < ort_total else "scorer-memory-overcount"
+        out.append(TensorDiff(
+            name="<scorer-memory>", bug_class=bug,
+            truth_shape=None, truth_dtype=None, truth_bytes=ort_total,
+            claim_shape=None, claim_dtype=None, claim_bytes=score.memory,
+            note=f"scorer={score.memory}B ORT={ort_total}B (excludes graph input/output)",
+        ))
+    return out
+
+
+def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResult,
+                 feeds: dict[str, np.ndarray] | None = None) -> DiffResult:
     """Compare oracle outputs and classify disagreements."""
     res = DiffResult(
         truth_total_bytes=truth.total_memory_bytes(),
@@ -290,6 +329,9 @@ def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResu
             claim_shape=None, claim_dtype=None, claim_bytes=None,
             note=f"ORT executed cleanly; onnx_tool: {claim.error[:200]}",
         ))
+        # Even when onnx_tool errors, we still want to know if the scorer (which
+        # uses onnx.shape_inference for memory + onnx_tool for MACs) rejects.
+        res.tensor_diffs.extend(_diff_scorer(model, truth, feeds))
         return res
 
     truth_tensors = truth.all_tensors()
@@ -366,6 +408,9 @@ def diff_oracles(model: onnx.ModelProto, truth: TruthResult, claim: OnnxToolResu
                     note=f"node {node.name} memory=0 ignores produced tensor (true={true_b}B)",
                 ))
 
+    # Compare the new neurogolf scorer's memory path (onnx.shape_inference) against ORT.
+    res.tensor_diffs.extend(_diff_scorer(model, truth, feeds))
+
     return res
 
 
@@ -435,7 +480,7 @@ def _run_case_impl(tc: TestCase | Scenario, progress=None) -> CaseResult:
     t = time.perf_counter()
     claim = run_onnx_tool(tc.model, tc.feeds)
     timings["onnx_tool"] = time.perf_counter() - t
-    diff = diff_oracles(tc.model, truth, claim)
+    diff = diff_oracles(tc.model, truth, claim, tc.feeds)
     timings["total"] = time.perf_counter() - t_case
     return CaseResult(case=tc, truth=truth, claim=claim, diff=diff, timings=timings)
 
